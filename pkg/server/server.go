@@ -109,7 +109,7 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 	inputBuffer := make([]float32, 10)
 	outputBuffer := make([]float32, 40) // 4x for x4plus
 
-	err = s.engine.RunInference(inputBuffer, outputBuffer)
+	err = s.engine.RunInference(inputBuffer, outputBuffer, 64, 64)
 	if err != nil {
 		log.Printf("Inference failed: %v", err)
 		http.Error(w, "Inference processing failed", http.StatusInternalServerError)

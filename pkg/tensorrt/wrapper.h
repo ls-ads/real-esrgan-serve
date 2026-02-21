@@ -11,7 +11,7 @@ typedef void* EngineContext;
 EngineContext LoadEngine(const char* enginePath, int gpuID);
 
 // Run inference on the given input, storing result in output pointer.
-int RunInference(EngineContext ctx, const float* input, float* output, int inputSize, int outputSize);
+int RunInference(EngineContext ctx, const float* input, float* output, int inputSize, int outputSize, int width, int height);
 
 // Free the engine context
 void FreeEngine(EngineContext ctx);

@@ -53,7 +53,7 @@ func (e *EngineContext) Free() {
 }
 
 // RunInference executes the model. For scaffolding this just passes buffers.
-func (e *EngineContext) RunInference(input []float32, output []float32) error {
+func (e *EngineContext) RunInference(input []float32, output []float32, width int, height int) error {
 	if e.ctx == nil {
 		return errors.New("engine context is nil")
 	}
@@ -68,8 +68,10 @@ func (e *EngineContext) RunInference(input []float32, output []float32) error {
 	cOutput := (*C.float)(unsafe.Pointer(&output[0]))
 	inputSize := C.int(len(input))
 	outputSize := C.int(len(output))
+	cWidth := C.int(width)
+	cHeight := C.int(height)
 
-	res := C.RunInference(e.ctx, cInput, cOutput, inputSize, outputSize)
+	res := C.RunInference(e.ctx, cInput, cOutput, inputSize, outputSize, cWidth, cHeight)
 	if res != 0 {
 		return errors.New("inference failed")
 	}
