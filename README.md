@@ -65,13 +65,19 @@ The `.engine` builder built into this tool is configured to dynamically accept i
 
 You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine.
 
-Create the ONNX using the official export script (`pytorch2onnx.py`) from the [Real-ESRGAN repository](https://github.com/xinntao/Real-ESRGAN/blob/master/scripts/pytorch2onnx.py):
+Because the official extraction script relies on PyTorch and OpenCV (which requires specific `C` libraries like `libgl1` and `libxcb`), we have provided an isolated Dockerfile to generate it reproducibly without clashing with your host system.
 
+1. Build the exporter image:
 ```bash
-python scripts/pytorch2onnx.py \
-    --input experiments/pretrained_models/RealESRGAN_x4plus.pth \
-    --output realesrgan-x4.onnx
+docker build -t realesrgan-onnx-exporter tools/onnx-export/
 ```
+
+2. Run the container, mounting your current directory to extract the output `.onnx` file:
+```bash
+docker run --rm -v $(pwd):/output realesrgan-onnx-exporter
+```
+
+This will automatically download the official `.pth` model, execute the trace, and save `realesrgan-x4plus.onnx` into your current directory!
 
 ## Limitations & VRAM
 
