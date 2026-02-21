@@ -15,13 +15,7 @@ WORKDIR /workspace
 RUN git clone https://github.com/xinntao/Real-ESRGAN.git .
 
 # Install python dependencies
-RUN pip install --no-cache-dir \
-    torch \
-    torchvision \
-    onnx \
-    basicsr \
-    facexlib \
-    gfpgan
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Download the official RealESRGAN_x4plus weights
 RUN mkdir -p experiments/pretrained_models && \
