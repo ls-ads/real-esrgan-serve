@@ -1,0 +1,21 @@
+# Compiled binaries
+real-esrgan-serve
+
+# Output files / directories
+*_out/
+*_out.*
+
+# TensorRT built engine files
+*.engine
+*.trt
+
+# Go workspace
+go.work
+go.work.sum
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# PID files
+*.pid
