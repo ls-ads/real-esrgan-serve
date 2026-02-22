@@ -76,6 +76,9 @@ curl -k -X POST -F "image=@path/to/image.jpg" "http://localhost:8080/upscale" -o
 
 ### 3. Builder
 
+> [!TIP]
+> **Pre-compiled Engines Available**: We have published pre-compiled, Architecture-Strict TensorRT engines for NVIDIA Ampere (`sm86`), Ada Lovelace (`sm89`), and Hopper (`sm90`) GPUs. You can download them directly from the [GitHub releases page](https://github.com/ls-ads/real-esrgan-serve/releases/tag/v0.1.0) and skip the build or cloud builder steps entirely!
+
 You can compile an ONNX model into a hardware-specific TensorRT `.engine` file via the build command:
 
 ```bash
