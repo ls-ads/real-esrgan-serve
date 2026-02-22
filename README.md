@@ -91,11 +91,12 @@ TensorRT compiles **Architecture-Strict** engines. This means an engine built on
 
 To streamline this, we provide a detached workflow image `tools/engine-build/Dockerfile` that handles the entire download-and-compile process gracefully:
 
-**Build and Push the Automated Image:**
+**Pull or Build the Automated Image:**
+You can pull the pre-built image directly from GitHub Container Registry:
 ```bash
-docker build -t your-username/real-esrgan-engine-build:latest tools/engine-build/
-docker push your-username/real-esrgan-engine-build:latest
+docker pull ghcr.io/ls-ads/real-esrgan-serve/engine-build:v0.1.0
 ```
+*(Alternatively, build it locally: `docker build -t engine-build:v0.1.0 tools/engine-build/`)*
 
 When you deploy this image onto any cloud GPU instance, simply mount a persistent volume (or local folder) onto the container's `/output` path. The container will automatically boot up, download the verified `realesrgan-x4plus.onnx` file from the remote Github releases, run the intense C++ engine building process targeting the specific hardware you rented, and safely drop the finished `.engine` file into your mounted folder before exiting.
 

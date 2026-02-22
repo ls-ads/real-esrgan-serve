@@ -16,6 +16,10 @@ RUN wget https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.1.0/re
 COPY build.sh /workspace/build.sh
 RUN chmod +x /workspace/build.sh
 
+LABEL org.opencontainers.image.source="https://github.com/ls-ads/real-esrgan-serve"
+LABEL org.opencontainers.image.description="Build TensorRT engines for Real-ESRGAN"
+LABEL org.opencontainers.image.title="real-esrgan-serve/engine-build"
+
 # When the container spins up on a remote cloud GPU architecture,
 # it executes build.sh to dynamically detect the GPU architecture & TRT version,
 # and generates a specific '.engine' file directly into the mounted /output directory.
