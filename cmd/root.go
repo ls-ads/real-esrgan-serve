@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	inputPath  string
-	outputPath string
-	gpuID      int
-	enginePath string
-	port       int
+	inputPath       string
+	outputPath      string
+	gpuID           int
+	enginePath      string
+	port            int
+	continueOnError bool
 )
 
 var rootCmd = &cobra.Command{
@@ -81,16 +82,19 @@ var rootCmd = &cobra.Command{
 				if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" {
 					inPath := filepath.Join(inputPath, file.Name())
 					outPath := filepath.Join(outputPath, file.Name())
-					processFile(inPath, outPath, gpuID, useHTTP, engine)
+					if err := processFile(inPath, outPath, gpuID, useHTTP, engine); err != nil {
+						fmt.Fprintf(os.Stderr, "Error processing %s\n", file.Name())
+						if !continueOnError {
+							os.Exit(1)
+						}
+					}
 				}
 			}
 		} else {
 			fmt.Printf("Input %s is a single file.\n", inputPath)
-			if outputPath == "" {
-				ext := filepath.Ext(inputPath)
-				outputPath = strings.TrimSuffix(inputPath, ext) + "_out" + ext
+			if err := processFile(inputPath, outputPath, gpuID, useHTTP, engine); err != nil {
+				os.Exit(1)
 			}
-			processFile(inputPath, outputPath, gpuID, useHTTP, engine)
 		}
 	},
 }
@@ -104,13 +108,13 @@ func isServerHealthy(port int) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.EngineContext) {
+func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.EngineContext) error {
 	fmt.Printf("Processing %s -> %s\n", in, out)
 
 	imgBytes, err := os.ReadFile(in)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read input file: %v\n", err)
-		return
+		return err
 	}
 
 	var outputBytes []byte
@@ -121,11 +125,11 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 		fw, err := w.CreateFormFile("image", filepath.Base(in))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create form file: %v\n", err)
-			return
+			return err
 		}
 		if _, err = io.Copy(fw, bytes.NewReader(imgBytes)); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to copy image to form: %v\n", err)
-			return
+			return err
 		}
 		w.Close()
 
@@ -134,7 +138,7 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 		req, err := http.NewRequest("POST", reqURL, &b)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
-			return
+			return err
 		}
 		req.Header.Set("Content-Type", w.FormDataContentType())
 
@@ -142,27 +146,27 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "HTTP request failed: %v\n", err)
-			return
+			return err
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			fmt.Fprintf(os.Stderr, "Server returned error %d: %s\n", resp.StatusCode, string(body))
-			return
+			return fmt.Errorf("server HTTP %d", resp.StatusCode)
 		}
 
 		outputBytes, err = io.ReadAll(resp.Body)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to read server response: %v\n", err)
-			return
+			return err
 		}
 	} else {
 		// Local Engine inference
 		tensor, width, height, err := imageutil.DecodeAndPreprocess(imgBytes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Image decoding failed: %v\n", err)
-			return
+			return err
 		}
 
 		outWidth := width * 4
@@ -172,20 +176,22 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 		err = engine.RunInference(tensor, outputBuffer, width, height)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Inference failed: %v\n", err)
-			return
+			return err
 		}
 
 		ext := filepath.Ext(out)
 		outputBytes, err = imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight, ext)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Image encoding failed: %v\n", err)
-			return
+			return err
 		}
 	}
 
 	if err := os.WriteFile(out, outputBytes, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to write output file: %v\n", err)
+		return err
 	}
+	return nil
 }
 
 func Execute() {
@@ -201,4 +207,5 @@ func init() {
 	rootCmd.Flags().IntVarP(&gpuID, "gpu-id", "g", 0, "GPU device to use")
 	rootCmd.Flags().StringVarP(&enginePath, "engine", "e", "", "Path to TensorRT engine file (used if HTTP server is not running)")
 	rootCmd.Flags().IntVarP(&port, "port", "p", 8080, "Port of the local HTTP server to route inference to")
+	rootCmd.Flags().BoolVarP(&continueOnError, "continue-on-error", "c", false, "Continue processing batch if an individual file fails")
 }

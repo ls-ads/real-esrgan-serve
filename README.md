@@ -42,6 +42,7 @@ You can run local inference on a single image file or an entire directory of ima
 
 - `-i`, `--input`: The input file path or directory path.
 - `-o`, `--output`: The output file path or directory path. If omitted, the tool automatically appends `_out` to the input name.
+- `-c`, `--continue-on-error`: (Optional) Continue processing the rest of a directory if an individual file fails (e.g., corrupted image or unsupported format). *Note: This flag applies only to directory batches; single-file failures will always exit immediately.*
 - `-g`, `--gpu-id`: (Optional) The GPU device ID to use (default: 0).
 
 *Note: The upscale ratio is fixed to 4x, as this is optimized for `realesrgan-x4plus`.*
