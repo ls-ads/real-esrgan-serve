@@ -1,10 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"real-esrgan-serve/pkg/imageutil"
+	"real-esrgan-serve/pkg/tensorrt"
 
 	"github.com/spf13/cobra"
 )
@@ -13,6 +20,8 @@ var (
 	inputPath  string
 	outputPath string
 	gpuID      int
+	enginePath string
+	port       int
 )
 
 var rootCmd = &cobra.Command{
@@ -25,6 +34,26 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error accessing input path: %v\n", err)
 			os.Exit(1)
+		}
+
+		// Try HTTP first
+		useHTTP := isServerHealthy(port)
+		var engine *tensorrt.EngineContext
+		if !useHTTP {
+			if enginePath == "" {
+				fmt.Fprintf(os.Stderr, "Error: HTTP server not running on port %d and --engine not provided for local fallback.\n", port)
+				os.Exit(1)
+			}
+			fmt.Printf("HTTP server not found on port %d, falling back to local TensorRT engine: %s\n", port, enginePath)
+			eng, err := tensorrt.LoadEngine(enginePath, gpuID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading engine: %v\n", err)
+				os.Exit(1)
+			}
+			engine = eng
+			defer engine.Free()
+		} else {
+			fmt.Printf("HTTP server found on port %d, routing inference tasks to server.\n", port)
 		}
 
 		if info.IsDir() {
@@ -52,7 +81,7 @@ var rootCmd = &cobra.Command{
 				if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" {
 					inPath := filepath.Join(inputPath, file.Name())
 					outPath := filepath.Join(outputPath, file.Name())
-					processFile(inPath, outPath, gpuID)
+					processFile(inPath, outPath, gpuID, useHTTP, engine)
 				}
 			}
 		} else {
@@ -61,14 +90,99 @@ var rootCmd = &cobra.Command{
 				ext := filepath.Ext(inputPath)
 				outputPath = strings.TrimSuffix(inputPath, ext) + "_out" + ext
 			}
-			processFile(inputPath, outputPath, gpuID)
+			processFile(inputPath, outputPath, gpuID, useHTTP, engine)
 		}
 	},
 }
 
-func processFile(in string, out string, gpu int) {
-	fmt.Printf("Processing %s -> %s on GPU %d\n", in, out, gpu)
-	// TODO: Implement actual inference integration here
+func isServerHealthy(port int) bool {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/health", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.EngineContext) {
+	fmt.Printf("Processing %s -> %s\n", in, out)
+
+	imgBytes, err := os.ReadFile(in)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read input file: %v\n", err)
+		return
+	}
+
+	var outputBytes []byte
+
+	if useHTTP {
+		var b bytes.Buffer
+		w := multipart.NewWriter(&b)
+		fw, err := w.CreateFormFile("image", filepath.Base(in))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create form file: %v\n", err)
+			return
+		}
+		if _, err = io.Copy(fw, bytes.NewReader(imgBytes)); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to copy image to form: %v\n", err)
+			return
+		}
+		w.Close()
+
+		req, err := http.NewRequest("POST", fmt.Sprintf("http://localhost:%d/upscale", port), &b)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", w.FormDataContentType())
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "HTTP request failed: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			fmt.Fprintf(os.Stderr, "Server returned error %d: %s\n", resp.StatusCode, string(body))
+			return
+		}
+
+		outputBytes, err = io.ReadAll(resp.Body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read server response: %v\n", err)
+			return
+		}
+	} else {
+		// Local Engine inference
+		tensor, width, height, err := imageutil.DecodeAndPreprocess(imgBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Image decoding failed: %v\n", err)
+			return
+		}
+
+		outWidth := width * 4
+		outHeight := height * 4
+		outputBuffer := make([]float32, 3*outWidth*outHeight)
+
+		err = engine.RunInference(tensor, outputBuffer, width, height)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Inference failed: %v\n", err)
+			return
+		}
+
+		outputBytes, err = imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Image encoding failed: %v\n", err)
+			return
+		}
+	}
+
+	if err := os.WriteFile(out, outputBytes, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write output file: %v\n", err)
+	}
 }
 
 func Execute() {
@@ -82,4 +196,6 @@ func init() {
 	rootCmd.Flags().StringVarP(&inputPath, "input", "i", "", "Input image path")
 	rootCmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output image path")
 	rootCmd.Flags().IntVarP(&gpuID, "gpu-id", "g", 0, "GPU device to use")
+	rootCmd.Flags().StringVarP(&enginePath, "engine", "e", "", "Path to TensorRT engine file (used if HTTP server is not running)")
+	rootCmd.Flags().IntVarP(&port, "port", "p", 8080, "Port of the local HTTP server to route inference to")
 }

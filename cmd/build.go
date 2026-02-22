@@ -9,8 +9,7 @@ import (
 )
 
 var (
-	onnxPath   string
-	enginePath string
+	onnxPath string
 )
 
 var buildCmd = &cobra.Command{

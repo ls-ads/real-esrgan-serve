@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"real-esrgan-serve/pkg/imageutil"
 	"real-esrgan-serve/pkg/tensorrt"
 )
 
@@ -102,14 +103,20 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	start := time.Now()
-	// TODO: Replace this with actual image decoding -> tensor float[] serialization -> inference byte[]
-	// For scoping we are stubbing the inference IO structure.
 
-	// Stub input/output sizes
-	inputBuffer := make([]float32, 10)
-	outputBuffer := make([]float32, 40) // 4x for x4plus
+	tensor, width, height, err := imageutil.DecodeAndPreprocess(imgBytes)
+	if err != nil {
+		log.Printf("Image decoding failed: %v", err)
+		http.Error(w, "Failed to decode and pre-process image", http.StatusBadRequest)
+		return
+	}
 
-	err = s.engine.RunInference(inputBuffer, outputBuffer, 64, 64)
+	// 4x upscaling output
+	outWidth := width * 4
+	outHeight := height * 4
+	outputBuffer := make([]float32, 3*outWidth*outHeight)
+
+	err = s.engine.RunInference(tensor, outputBuffer, width, height)
 	if err != nil {
 		log.Printf("Inference failed: %v", err)
 		http.Error(w, "Inference processing failed", http.StatusInternalServerError)
@@ -118,8 +125,14 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Inference completed in %v", time.Since(start))
 
-	// Stub: return the raw output bytes (or a placeholder image byte array)
-	w.Header().Set("Content-Type", "application/octet-stream")
+	pngBytes, err := imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight)
+	if err != nil {
+		log.Printf("Image encoding failed: %v", err)
+		http.Error(w, "Failed to encode output image", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("upscaled_image_bytes_placeholder"))
+	w.Write(pngBytes)
 }
