@@ -88,7 +88,10 @@ int RunInference(EngineContext ctx, const float* input, float* output, int input
     // 1. Establish the exact concrete dimension for this invocation
     // The C++ API requires us to explicitly tell the dynamic profile what shape is actually hitting it
     Dims4 inputDims{1, 3, height, width};
-    trt->context->setInputShape("input", inputDims);
+    if (!trt->context->setInputShape("input", inputDims)) {
+        std::cerr << "[C++] Invalid input shape for the engine. Max dimensions exceeded?" << std::endl;
+        return 1;
+    }
 
     void* deviceInput = nullptr;
     void* deviceOutput = nullptr;
@@ -200,10 +203,10 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     ITensor* inputTensor = network->getInput(0);
     const char* inputName = inputTensor->getName();
     
-    // min: 1x3x64x64, opt: 1x3x512x512, max: 1x3x1024x1024
+    // min: 1x3x64x64, opt: 1x3x512x512, max: 1x3x2048x2048
     profile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4{1, 3, 64, 64});
     profile->setDimensions(inputName, OptProfileSelector::kOPT, Dims4{1, 3, 512, 512});
-    profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4{1, 3, 1024, 1024});
+    profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4{1, 3, 2048, 2048});
     
     config->addOptimizationProfile(profile);
 
