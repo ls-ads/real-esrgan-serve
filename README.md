@@ -85,6 +85,34 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 > [!CAUTION]
 > **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM) because TensorRT must compile and evaluate multiple tactics for the maximum supported resolution ($1280 \times 1280$). You will need a GPU with **at least 16GB of VRAM** (e.g., RTX 3080 Ti/4080, A4000) to successfully build the engine without hitting an out-of-memory (`UNSUPPORTED_STATE`) error.
 
+## Docker
+
+If you don't want to install the heavy TensorRT and CUDA C++ dependencies natively on your host machine, you can run the entire CLI via Docker. The container acts exactly like the native binary using an `ENTRYPOINT`.
+
+**1. Build the image locally:**
+```bash
+docker build -t real-esrgan-serve:latest .
+```
+
+**2. Local Inference:**
+Mount your local images into the container's `/workspace` directory using the `-v` flag:
+```bash
+docker run --rm --gpus all \
+  -v $(pwd)/images:/workspace \
+  real-esrgan-serve:latest \
+  -i /workspace/input.jpg -o /workspace/output.jpg
+```
+
+**3. HTTP Server:**
+Start the background server, map a port, and mount a directory containing your models:
+```bash
+docker run -d --gpus all \
+  -v $(pwd)/models:/workspace \
+  -p 8080:8080 \
+  real-esrgan-serve:latest \
+  server start -p 8080 -e /workspace/realesrgan-x4plus.engine
+```
+
 ## Generating the ONNX Model
 
 You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine. 
