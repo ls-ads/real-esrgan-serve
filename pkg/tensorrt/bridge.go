@@ -1,7 +1,7 @@
 package tensorrt
 
 /*
-#cgo LDFLAGS: -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lcudart -lnvinfer -lstdc++
+#cgo LDFLAGS: -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lcudart -lnvinfer -lnvonnxparser -lstdc++
 #cgo CXXFLAGS: -I/usr/local/cuda/include -I/usr/lib/x86_64-linux-gnu/include -std=c++17 -Wall -O3
 #include <stdlib.h>
 #include "wrapper.h"
