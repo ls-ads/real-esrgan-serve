@@ -23,7 +23,14 @@ This will output the `real-esrgan-serve` binary.
 
 ### 1. Local Inference (File or Directory)
 
-You can run local inference on a single image file or an entire directory of images. The CLI natively iterates and processes all images within the directory if one is provided. Supported formats: `.png`, `.jpg`, `.jpeg`, `.webp`.
+You can run local inference on a single image file or an entire directory of images. The CLI natively iterates and processes all images within the directory if one is provided. 
+
+**Supported Formats:**
+- **Inputs:** `.png`, `.jpg`, `.jpeg`
+- **Outputs:** `.png` (lossless, slower to encode 5K images), `.jpg` / `.jpeg` (fast, high-quality compressed)
+
+> [!TIP]
+> **Performance Tip**: Exporting to `.jpg` is significantly faster than `.png`. Because the 4x upscaling creates massive 5K+ images, lossless PNG CPU-encoding can take over 5 seconds on the server. Specifying `.jpg` for your output file drops that CPU bottleneck to under a second!
 
 ```bash
 # Process a single image
