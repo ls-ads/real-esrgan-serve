@@ -194,8 +194,8 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());
     if (!config) return 1;
 
-    // Set memory pool limit (e.g., 12GB workspace for large profiles)
-    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 12ULL << 30);
+    // Set memory pool limit (e.g., 4GB workspace)
+    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 4ULL << 30);
 
     // 4. Configure Optimization Profile for Dynamic Shapes
     // The provided ONNX trace statically bakes in 1x3x64x64. We must override the input layer bounds.
@@ -203,10 +203,10 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     ITensor* inputTensor = network->getInput(0);
     const char* inputName = inputTensor->getName();
     
-    // min: 1x3x64x64, opt: 1x3x512x512, max: 1x3x2048x2048
+    // min: 1x3x64x64, opt: 1x3x512x512, max: 1x3x1280x1280
     profile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4{1, 3, 64, 64});
     profile->setDimensions(inputName, OptProfileSelector::kOPT, Dims4{1, 3, 512, 512});
-    profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4{1, 3, 2048, 2048});
+    profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4{1, 3, 1280, 1280});
     
     config->addOptimizationProfile(profile);
 
