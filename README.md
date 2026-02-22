@@ -26,7 +26,7 @@ This will output the `real-esrgan-serve` binary.
 You can run local inference on a single image file or an entire directory of images. The CLI natively iterates and processes all images within the directory if one is provided. 
 
 **Supported Formats:**
-- **Inputs:** `.png`, `.jpg`, `.jpeg`
+- **Inputs:** `.png`, `.jpg`, `.jpeg` (Max resolution: $1280 \times 1280$ pixels). *Any image exceeding these dimensions on either axis will be cleanly rejected.*
 - **Outputs:** `.png` (lossless, slower to encode 5K images), `.jpg` / `.jpeg` (fast, high-quality compressed). *Any unsupported or missing output extension will automatically fallback to being encoded as a PNG.*
   - **Determinism:** If you process the exact same input image using the exact same TensorRT `.engine` file on the exact same physical GPU, the mathematical matrix multiplication path chosen by the compiled execution context is 100% deterministic. The resulting upscaled output image will have an identical byte structure and MD5 checksum across multiple runs, server restarts, and system reboots.
 
