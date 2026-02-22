@@ -68,10 +68,10 @@ Once the server is running, you can bypass the CLI entirely and send images dire
 
 ```bash
 # Upscale and save as a high-speed JPEG
-curl -k -X POST -F "image=@input.jpg" "http://localhost:8080/upscale?ext=.jpg" -o output.jpg
+curl -k -X POST -F "image=@path/to/image.jpg" "http://localhost:8080/upscale?ext=.jpg" -o path/to/output.jpg
 
 # Upscale and save as a lossless PNG (default)
-curl -k -X POST -F "image=@input.jpg" "http://localhost:8080/upscale" -o output.png
+curl -k -X POST -F "image=@path/to/image.jpg" "http://localhost:8080/upscale" -o path/to/output.png
 ```
 
 ### 3. Builder
