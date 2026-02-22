@@ -85,7 +85,7 @@ This will automatically download the official `.pth` model, execute the trace, a
 To ensure the mathematical graph sequence was exported flawlessly without any hardware translation discrepancies, verify the MD5 checksum of the generated `.onnx` file:
 ```bash
 $ md5sum realesrgan-x4plus.onnx 
-6216c6b3d76719b0732fc49bb0f6c879  realesrgan-x4plus.onnx
+20eb537004dfed40ff393a89d46c9fb7  realesrgan-x4plus.onnx
 ```
 
 ## Limitations & VRAM
