@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
+	"strings"
 )
 
 // DecodeAndPreprocess reads an image byte slice, decodes it, and returns
@@ -52,9 +53,10 @@ func DecodeAndPreprocess(imgBytes []byte) ([]float32, int, int, error) {
 }
 
 // PostprocessAndEncode takes a float32 NCHW tensor from Real-ESRGAN TensorRT
-// inference and encodes it directly back into a PNG byte slice.
+// inference and encodes it directly back into a byte slice of the requested format.
+// Supported extensions: .png, .jpg, .jpeg
 // Pixels are denormalized from [0, 1].
-func PostprocessAndEncode(tensor []float32, width int, height int) ([]byte, error) {
+func PostprocessAndEncode(tensor []float32, width int, height int, ext string) ([]byte, error) {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	planeSize := width * height
 
@@ -93,8 +95,19 @@ func PostprocessAndEncode(tensor []float32, width int, height int) ([]byte, erro
 	}
 
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, fmt.Errorf("failed to encode png: %w", err)
+	ext = strings.ToLower(ext)
+
+	switch ext {
+	case ".jpg", ".jpeg":
+		// Fast JPEG encoding with high quality
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
+			return nil, fmt.Errorf("failed to encode jpeg: %w", err)
+		}
+	default:
+		// Fallback to PNG
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, fmt.Errorf("failed to encode png: %w", err)
+		}
 	}
 
 	return buf.Bytes(), nil

@@ -125,14 +125,20 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Inference completed in %v", time.Since(start))
 
-	pngBytes, err := imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight)
+	ext := r.URL.Query().Get("ext")
+	pngBytes, err := imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight, ext)
 	if err != nil {
 		log.Printf("Image encoding failed: %v", err)
 		http.Error(w, "Failed to encode output image", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "image/png")
+	contentType := "image/png"
+	if ext == ".jpg" || ext == ".jpeg" {
+		contentType = "image/jpeg"
+	}
+
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	w.Write(pngBytes)
 }

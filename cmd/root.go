@@ -129,7 +129,9 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 		}
 		w.Close()
 
-		req, err := http.NewRequest("POST", fmt.Sprintf("http://localhost:%d/upscale", port), &b)
+		ext := filepath.Ext(out)
+		reqURL := fmt.Sprintf("http://localhost:%d/upscale?ext=%s", port, ext)
+		req, err := http.NewRequest("POST", reqURL, &b)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create request: %v\n", err)
 			return
@@ -173,7 +175,8 @@ func processFile(in string, out string, gpu int, useHTTP bool, engine *tensorrt.
 			return
 		}
 
-		outputBytes, err = imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight)
+		ext := filepath.Ext(out)
+		outputBytes, err = imageutil.PostprocessAndEncode(outputBuffer, outWidth, outHeight, ext)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Image encoding failed: %v\n", err)
 			return
