@@ -59,6 +59,9 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 ./real-esrgan-serve build --onnx path/to/model.onnx --engine path/to/model.engine
 ```
 
+> [!CAUTION]
+> **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM) because TensorRT must compile and evaluate multiple tactics for the maximum supported resolution ($1280 \times 1280$). You will need a GPU with **at least 16GB of VRAM** (e.g., RTX 3080 Ti/4080, A4000) to successfully build the engine without hitting an out-of-memory (`UNSUPPORTED_STATE`) error.
+
 ## Generating the ONNX Model
 
 You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine. 
@@ -92,7 +95,9 @@ $ md5sum realesrgan-x4plus.onnx
 
 Because this tool relies on the `realesrgan-x4plus` model processing via TensorRT, it holds the following constraints:
 
-1. **Memory Ceiling**: All TensorRT context memory linearly correlates with the input image's dimensions. Since the `realesrgan-x4plus` model outputs are exactly 4x the input size in width and height (yielding a $16\times$ larger pixel map overall), large input files (e.g., $1920\times 1080$ and above) will cause drastic spikes in VRAM usage during the convolution and upscaling execution layers. Expect an Out Of Memory (OOM) exception on smaller GPUs for large input imagery.
+1. **Memory Ceiling**: All TensorRT context memory linearly correlates with the input image's dimensions. Since the `realesrgan-x4plus` model outputs are exactly 4x the input size in width and height (yielding a $16\times$ larger pixel map overall), large input files will cause drastic spikes in VRAM usage.
+   - **Maximum Supported Resolution**: The default TensorRT execution context enforces a strict dynamic bounding box limit of **$1280 \times 1280$**. Any image exceeding these dimensions on either axis will be cleanly rejected by the server prior to processing.
+   - **Inference Footprint (720p Example)**: Because TensorRT statically reserves the required VRAM for its allocated execution profiles, running inference on a standard 720p image (e.g., $1280 \times 720$) will result in a dedicated **~14GB VRAM footprint** on your GPU while the engine is loaded.
 2. **Dimension Tiling**: While other implementations fallback to patching or "tiling" to solve VRAM exhaustions, this pure C++ backend expects the entire activation map locally. Future updates may introduce chunking for massive geometries.
 ## Acknowledgements
 
