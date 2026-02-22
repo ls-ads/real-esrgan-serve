@@ -107,7 +107,7 @@ docker run --rm --gpus all \
   ghcr.io/ls-ads/real-esrgan-serve/engine-build:v0.1.0
 ```
 
-> **Dynamic Naming (`smXX`)**: The container will automatically parse the host's exact compute capability directly from the NVIDIA driver and dynamically name your engine file with the `sm` prefix and TensorRT version (e.g., `realesrgan-x4plus-sm86-trt10.0.engine` or `realesrgan-x4plus-sm89-trt8.6.engine`).
+> **Dynamic Naming (`smXX`)**: The container will automatically parse the host's exact compute capability directly from the NVIDIA driver and dynamically name your engine file with the `sm` prefix and TensorRT version. For example, building on an **RTX A4000** yields: `realesrgan-x4plus-sm86-trt10.14.engine`.
 
 ## Docker
 
