@@ -30,5 +30,8 @@ LABEL org.opencontainers.image.source="https://github.com/ls-ads/real-esrgan-ser
 LABEL org.opencontainers.image.description="Export RealESRGAN_x4plus.pth to ONNX format"
 LABEL org.opencontainers.image.title="real-esrgan-serve/onnx-export"
 
+# Copy custom dynamic exporter
+COPY onnx_export.py .
+
 # Set the entrypoint to run the conversion script and output to the mounted volume
-ENTRYPOINT [".venv/bin/python", "scripts/pytorch2onnx.py", "--input", "weights/RealESRGAN_x4plus.pth", "--output", "/output/realesrgan-x4plus.onnx", "--params"]
+ENTRYPOINT [".venv/bin/python", "onnx_export.py", "--input", "weights/RealESRGAN_x4plus.pth", "--output", "/output/realesrgan-x4plus.onnx", "--params"]
