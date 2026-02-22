@@ -27,7 +27,7 @@ You can run local inference on a single image file or an entire directory of ima
 
 **Supported Formats:**
 - **Inputs:** `.png`, `.jpg`, `.jpeg`
-- **Outputs:** `.png` (lossless, slower to encode 5K images), `.jpg` / `.jpeg` (fast, high-quality compressed)
+- **Outputs:** `.png` (lossless, slower to encode 5K images), `.jpg` / `.jpeg` (fast, high-quality compressed). *Any unsupported or missing output extension will automatically fallback to being encoded as a PNG.*
 
 > [!TIP]
 > **Performance Tip**: Exporting to `.jpg` is significantly faster than `.png`. Because the 4x upscaling creates massive 5K+ images, lossless PNG CPU-encoding can take over 5 seconds on the server. Specifying `.jpg` for your output file drops that CPU bottleneck to under a second!
