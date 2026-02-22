@@ -85,6 +85,22 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 > [!CAUTION]
 > **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM) because TensorRT must compile and evaluate multiple tactics for the maximum supported resolution ($1280 \times 1280$). You will need a GPU with **at least 16GB of VRAM** (e.g., RTX 3080 Ti/4080, A4000) to successfully build the engine without hitting an out-of-memory (`UNSUPPORTED_STATE`) error.
 
+### 4. Cloud Engine Builder
+
+TensorRT compiles **Architecture-Strict** engines. This means an engine built on an RTX 3090 (`sm86` compute capability) contains hardware-specific CUDA kernel optimizations that will crash if executed on an A100 (`sm80`) or RTX 4090 (`sm89`). Because engines are strictly locked to the silicon architecture that compiled them, most users rent temporary cloud GPUs that match their deployment targets to generate them.
+
+To streamline this, we provide a detached workflow image `tools/engine-build/Dockerfile` that handles the entire download-and-compile process gracefully:
+
+**Build and Push the Automated Image:**
+```bash
+docker build -t your-username/real-esrgan-engine-build:latest tools/engine-build/
+docker push your-username/real-esrgan-engine-build:latest
+```
+
+When you deploy this image onto any cloud GPU instance, simply mount a persistent volume (or local folder) onto the container's `/output` path. The container will automatically boot up, download the verified `realesrgan-x4plus.onnx` file from the remote Github releases, run the intense C++ engine building process targeting the specific hardware you rented, and safely drop the finished `.engine` file into your mounted folder before exiting.
+
+> **Dynamic Naming (`smXX`)**: The container will automatically parse the host's exact compute capability directly from the NVIDIA driver and dynamically name your engine file with the `sm` prefix and TensorRT version (e.g., `realesrgan-x4plus-sm86-trt10.0.engine` or `realesrgan-x4plus-sm89-trt8.6.engine`).
+
 ## Docker
 
 If you don't want to install the heavy TensorRT and CUDA C++ dependencies natively on your host machine, you can run the entire CLI via Docker. The container acts exactly like the native binary using an `ENTRYPOINT`.
