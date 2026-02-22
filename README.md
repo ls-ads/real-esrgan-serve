@@ -61,9 +61,10 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 
 ## Generating the ONNX Model
 
-The `.engine` builder built into this tool is configured to dynamically accept input dimensions scaling from `64x64` up to `1024x1024`. It strips out the fixed image constraints baked into standard ONNX trace graphs via TensorRT `IOptimizationProfile`.
+You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine. 
 
-You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine.
+> [!TIP]
+> **Pre-exported Model Available**: We have already exported the standard `realesrgan-x4plus` model to ONNX for you. You can download the verified [realesrgan-x4plus.onnx](https://github.com/ls-ads/real-esrgan-serve/releases/tag/v0.1.0) directly from the GitHub releases page.
 
 Because the official extraction script relies on PyTorch and OpenCV (which requires specific `C` libraries like `libgl1` and `libxcb`), we have provided an isolated Dockerfile to generate it reproducibly without clashing with your host system.
 
