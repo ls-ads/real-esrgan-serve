@@ -89,17 +89,19 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 
 If you don't want to install the heavy TensorRT and CUDA C++ dependencies natively on your host machine, you can run the entire CLI via Docker. The container acts exactly like the native binary using an `ENTRYPOINT`.
 
-**1. Build the image locally:**
+**1. Pull or Build the Image:**
+You can pull the pre-built image directly from the GitHub Container Registry:
 ```bash
-docker build -t real-esrgan-serve:latest .
+docker pull ghcr.io/ls-ads/real-esrgan-serve/cli:v0.1.0
 ```
+*(Alternatively, build it locally: `docker build -t real-esrgan-serve:v0.1.0 .`)*
 
 **2. Local Inference:**
 Mount your local images into the container's `/workspace` directory using the `-v` flag:
 ```bash
 docker run --rm --gpus all \
   -v $(pwd)/images:/workspace \
-  real-esrgan-serve:latest \
+  ghcr.io/ls-ads/real-esrgan-serve/cli:v0.1.0 \
   -i /workspace/input.jpg -o /workspace/output.jpg
 ```
 
@@ -109,7 +111,7 @@ Start the background server, map a port, and mount a directory containing your m
 docker run -d --gpus all \
   -v $(pwd)/models:/workspace \
   -p 8080:8080 \
-  real-esrgan-serve:latest \
+  ghcr.io/ls-ads/real-esrgan-serve/cli:v0.1.0 \
   server start -p 8080 -e /workspace/realesrgan-x4plus.engine
 ```
 
