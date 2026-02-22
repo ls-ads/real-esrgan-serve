@@ -42,7 +42,9 @@ You can run local inference on a single image file or an entire directory of ima
 ```
 
 - `-i`, `--input`: The input file path or directory path.
-- `-o`, `--output`: The output file path or directory path. If omitted, the tool automatically appends `_out` to the input name.
+- `-o`, `--output`: The output file path or directory path. 
+  - For single input files, omitting this flag appends `_out` to the filename (e.g., `image.jpg` → `image_out.jpg`).
+  - For input directories, the tool assumes the output is also a directory and will automatically create it if it does not exist. If omitted, it appends `_out` directly to the input directory name (e.g., `input_dir` → `input_dir_out`), keeping your original input directory completely untouched.
 - `-c`, `--continue-on-error`: (Optional) Continue processing the rest of a directory if an individual file fails (e.g., corrupted image or unsupported format). *Note: This flag applies only to directory batches; single-file failures will always exit immediately.*
 - `-g`, `--gpu-id`: (Optional) The GPU device ID to use (default: 0).
 
