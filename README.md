@@ -67,17 +67,25 @@ You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-E
 
 Because the official extraction script relies on PyTorch and OpenCV (which requires specific `C` libraries like `libgl1` and `libxcb`), we have provided an isolated Dockerfile to generate it reproducibly without clashing with your host system.
 
-1. Build the exporter image:
+1. Pull or build the exporter image:
 ```bash
-docker build -t realesrgan-onnx-exporter tools/onnx-export/
+docker pull ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
+# Alternatively, build locally: docker build -t ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 tools/onnx-export/
 ```
 
 2. Run the container, mounting your current directory to extract the output `.onnx` file:
 ```bash
-docker run --rm -v $(pwd):/output realesrgan-onnx-exporter
+docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
 ```
 
 This will automatically download the official `.pth` model, execute the trace, and save `realesrgan-x4plus.onnx` into your current directory!
+
+### Verification
+To ensure the mathematical graph sequence was exported flawlessly without any hardware translation discrepancies, verify the MD5 checksum of the generated `.onnx` file:
+```bash
+$ md5sum realesrgan-x4plus.onnx 
+6216c6b3d76719b0732fc49bb0f6c879  realesrgan-x4plus.onnx
+```
 
 ## Limitations & VRAM
 
