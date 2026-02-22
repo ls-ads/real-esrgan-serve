@@ -5,7 +5,8 @@ real-esrgan-serve
 *_out/
 *_out.*
 
-# TensorRT built engine files
+# ONNX / TensorRT built engine files
+*.onnx
 *.engine
 *.trt
 
