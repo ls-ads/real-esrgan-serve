@@ -100,6 +100,13 @@ docker pull ghcr.io/ls-ads/real-esrgan-serve/engine-build:v0.1.0
 
 When you deploy this image onto any cloud GPU instance, simply mount a persistent volume (or local folder) onto the container's `/output` path. The container will automatically boot up, download the verified `realesrgan-x4plus.onnx` file from the remote Github releases, run the intense C++ engine building process targeting the specific hardware you rented, and safely drop the finished `.engine` file into your mounted folder before exiting.
 
+**Run the Builder:**
+```bash
+docker run --rm --gpus all \
+  -v $(pwd)/models:/output \
+  ghcr.io/ls-ads/real-esrgan-serve/engine-build:v0.1.0
+```
+
 > **Dynamic Naming (`smXX`)**: The container will automatically parse the host's exact compute capability directly from the NVIDIA driver and dynamically name your engine file with the `sm` prefix and TensorRT version (e.g., `realesrgan-x4plus-sm86-trt10.0.engine` or `realesrgan-x4plus-sm89-trt8.6.engine`).
 
 ## Docker
