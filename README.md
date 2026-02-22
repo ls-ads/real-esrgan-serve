@@ -62,6 +62,18 @@ To avoid the overhead of loading the model into VRAM for every image, you can st
 ./real-esrgan-serve server stop
 ```
 
+### Direct API Usage (cURL)
+
+Once the server is running, you can bypass the CLI entirely and send images directly to the `/upscale` endpoint using standard HTTP multipart form requests. You can optionally specify the desired output format via the `?ext=` query parameter (`.jpg` or `.png`).
+
+```bash
+# Upscale and save as a high-speed JPEG
+curl -k -X POST -F "image=@input.jpg" "http://localhost:8080/upscale?ext=.jpg" -o output.jpg
+
+# Upscale and save as a lossless PNG (default)
+curl -k -X POST -F "image=@input.jpg" "http://localhost:8080/upscale" -o output.png
+```
+
 ### 3. Builder
 
 You can compile an ONNX model into a hardware-specific TensorRT `.engine` file via the build command:
