@@ -92,6 +92,15 @@ var rootCmd = &cobra.Command{
 			}
 		} else {
 			fmt.Printf("Input %s is a single file.\n", inputPath)
+			if outputPath == "" {
+				ext := filepath.Ext(inputPath)
+				// If the extension is empty, default to .png
+				if ext == "" {
+					ext = ".png"
+				}
+				// e.g. path/to/image.jpg -> path/to/image_out.jpg
+				outputPath = strings.TrimSuffix(inputPath, ext) + "_out" + ext
+			}
 			if err := processFile(inputPath, outputPath, gpuID, useHTTP, engine); err != nil {
 				os.Exit(1)
 			}
