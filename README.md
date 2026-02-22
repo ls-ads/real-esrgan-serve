@@ -93,4 +93,15 @@ Because this tool relies on the `realesrgan-x4plus` model processing via TensorR
 
 1. **Memory Ceiling**: All TensorRT context memory linearly correlates with the input image's dimensions. Since the `realesrgan-x4plus` model outputs are exactly 4x the input size in width and height (yielding a $16\times$ larger pixel map overall), large input files (e.g., $1920\times 1080$ and above) will cause drastic spikes in VRAM usage during the convolution and upscaling execution layers. Expect an Out Of Memory (OOM) exception on smaller GPUs for large input imagery.
 2. **Dimension Tiling**: While other implementations fallback to patching or "tiling" to solve VRAM exhaustions, this pure C++ backend expects the entire activation map locally. Future updates may introduce chunking for massive geometries.
-3. **Optimized Engine Size**: The compiled `.engine` profile must be specifically generated for the target shape you intend to run (with min/opt/max bounds defined). Images that far exceed your engine's `.max` profile dimensions will fail to enqueue.
+## Acknowledgements
+
+This project is a bridge to the TensorRT implementation of Real-ESRGAN. We would like to give full credit to the original authors and the official project:
+
+- **Original Project**: [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
+- **Author**: [xinntao](https://github.com/xinntao)
+
+The `realesrgan-x4plus` model and the underlying architecture are products of the research and development by the original authors.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
