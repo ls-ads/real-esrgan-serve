@@ -194,8 +194,8 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     std::unique_ptr<IBuilderConfig> config(builder->createBuilderConfig());
     if (!config) return 1;
 
-    // Set memory pool limit (e.g., 4GB workspace)
-    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 4ULL << 30);
+    // Set memory pool limit (e.g., 12GB workspace for large profiles)
+    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 12ULL << 30);
 
     // 4. Configure Optimization Profile for Dynamic Shapes
     // The provided ONNX trace statically bakes in 1x3x64x64. We must override the input layer bounds.
