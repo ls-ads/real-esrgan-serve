@@ -17,6 +17,7 @@ public:
         }
     }
 } gLogger;
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -63,15 +64,15 @@ EngineContext LoadEngine(const char* enginePath, int gpuID) {
 
     trt->engine = trt->runtime->deserializeCudaEngine(buffer.data(), size);
     if (!trt->engine) {
-        trt->runtime->destroy();
+        delete trt->runtime;
         delete trt;
         return nullptr;
     }
 
     trt->context = trt->engine->createExecutionContext();
     if (!trt->context) {
-        trt->engine->destroy();
-        trt->runtime->destroy();
+        delete trt->engine;
+        delete trt->runtime;
         delete trt;
         return nullptr;
     }
@@ -159,9 +160,9 @@ void FreeEngine(EngineContext ctx) {
     std::cout << "[C++] Freeing Engine Context..." << std::endl;
     TrtContext* trt = static_cast<TrtContext*>(ctx);
     
-    if (trt->context) trt->context->destroy();
-    if (trt->engine) trt->engine->destroy();
-    if (trt->runtime) trt->runtime->destroy();
+    if (trt->context) delete trt->context;
+    if (trt->engine) delete trt->engine;
+    if (trt->runtime) delete trt->runtime;
     
     delete trt;
 }
