@@ -174,8 +174,8 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     std::unique_ptr<IBuilder> builder(createInferBuilder(gLogger));
     if (!builder) return 1;
 
-    uint32_t flag = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-    std::unique_ptr<INetworkDefinition> network(builder->createNetworkV2(flag));
+    // kEXPLICIT_BATCH is deprecated in TensorRT 10.x and is the default behavior.
+    std::unique_ptr<INetworkDefinition> network(builder->createNetworkV2(0));
     if (!network) return 1;
 
     // 2. Parse ONNX
