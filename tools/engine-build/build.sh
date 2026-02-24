@@ -45,8 +45,8 @@ echo "------------------------------------------------------"
 echo "Compiling Engine ($PRECISION): $OUT_PATH"
 echo "------------------------------------------------------"
 
-# We assume the matching ONNX file is provided in /workspace
-/app/real-esrgan-serve build --onnx "/workspace/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" $FP16_FLAG
+# We assume the matching ONNX file is provided in /app
+/app/real-esrgan-serve build --onnx "/app/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" $FP16_FLAG
 
 echo "------------------------------------------------------"
 echo "Engine compiled successfully!"
