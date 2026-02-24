@@ -42,7 +42,7 @@ var buildCmd = &cobra.Command{
 func init() {
 	buildCmd.Flags().StringVarP(&onnxPath, "onnx", "x", "", "Path to the input ONNX model")
 	buildCmd.Flags().StringVarP(&enginePath, "engine", "e", "", "Path to the output TensorRT engine file")
-	buildCmd.Flags().BoolVar(&useFP16, "fp16", true, "Build the engine with FP16 precision")
+	buildCmd.Flags().BoolVar(&useFP16, "fp16", false, "Build the engine with FP16 precision")
 	buildCmd.MarkFlagRequired("onnx")
 	buildCmd.MarkFlagRequired("engine")
 

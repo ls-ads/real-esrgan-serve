@@ -30,26 +30,29 @@ GPU_NAME_SAN=$(echo "$GPU_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/
 
 echo "Detected GPU: $GPU_NAME ($ARCH)"
 
-# 3. Build the Engine
-PRECISION=${PRECISION:-fp16}
-if [ "$PRECISION" = "fp16" ]; then
-    FP16_FLAG="--fp16"
-    SUFFIX="_fp16"
-else
-    # In Cobra, --fp16=false is the way to disable a boolean flag
-    FP16_FLAG="--fp16=false"
-    SUFFIX="_fp32"
-fi
+# 3. Build the Engines
 
+# 3.1 Build FP16 Engine
+PRECISION="fp16"
+SUFFIX="_fp16"
 OUT_NAME="realesrgan-x4plus-${GPU_NAME_SAN}-${ARCH}-trt${TRT_VER}${SUFFIX}.engine"
 OUT_PATH="/output/${OUT_NAME}"
 
 echo "------------------------------------------------------"
 echo "Compiling Engine ($PRECISION): $OUT_PATH"
 echo "------------------------------------------------------"
+/app/real-esrgan-serve build --onnx "/app/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" --fp16
 
-# We assume the matching ONNX file is provided in /app
-/app/real-esrgan-serve build --onnx "/app/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" $FP16_FLAG
+# 3.2 Build FP32 Engine
+PRECISION="fp32"
+SUFFIX="_fp32"
+OUT_NAME="realesrgan-x4plus-${GPU_NAME_SAN}-${ARCH}-trt${TRT_VER}${SUFFIX}.engine"
+OUT_PATH="/output/${OUT_NAME}"
+
+echo "------------------------------------------------------"
+echo "Compiling Engine ($PRECISION): $OUT_PATH"
+echo "------------------------------------------------------"
+/app/real-esrgan-serve build --onnx "/app/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH"
 
 touch /output/DONE
 
