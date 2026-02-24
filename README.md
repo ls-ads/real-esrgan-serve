@@ -89,6 +89,8 @@ You can compile an ONNX model into a hardware-specific TensorRT `.engine` file v
 > **FP16 Recommended**: Building with the `--fp16` flag (enabled by default) enables half-precision optimizations. This significantly reduces the VRAM footprint and improves performance on modern GPUs (Maxwell architecture and newer). 
 > 
 > **Note on ONNX precision**: You do **not** need a half-precision `.onnx` file to build an FP16 engine. TensorRT will automatically cast the internal weights to FP16 during compilation if the `--fp16` flag is provided. However, using a half-precision ONNX file (via the `--half` export flag) is also supported.
+> 
+> **Note on Interface Compatibility**: Even when `--fp16` is enabled, the model's external input and output buffers remain **32-bit float (FP32)**. This ensures standard compatibility with the Go frontend and existing image processing logic (`imageutil.go`) while still reaping the 50% VRAM savings and speed from internal half-precision math.
 
 > [!CAUTION]
 > **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM). 
