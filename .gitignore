@@ -19,4 +19,6 @@ go.work.sum
 Thumbs.db
 
 # PID files
-*.pid
+
+# GitHub Release Scripts
+gh/
