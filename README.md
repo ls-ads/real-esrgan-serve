@@ -179,9 +179,8 @@ docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v
 
 This will automatically download the official `.pth` model, execute the trace, and save **`realesrgan-x4plus_fp16.onnx`** into your current directory!
 
-> [!TIP]
-> **FP32 Export**: If you explicitly require a full-precision (FP32) ONNX model, you can override the default entrypoint flags by running:
-> `docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 --half=false`
+> **FP32 Export**: If you explicitly require a full-precision (FP32) ONNX model, you can override the default by running:
+> `docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 --half false`
 > (This will generate `realesrgan-x4plus_fp32.onnx`).
 
 ### Verification

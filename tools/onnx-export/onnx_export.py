@@ -53,10 +53,20 @@ if __name__ == '__main__':
     """Convert pytorch model to onnx models with dynamic axes"""
     import argparse
     parser = argparse.ArgumentParser()
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
+
     parser.add_argument(
         '--input', type=str, default='weights/RealESRGAN_x4plus.pth', help='Input model path')
     parser.add_argument('--params', action='store_false', help='Use params instead of params_ema')
-    parser.add_argument('--half', action='store_true', help='Export with half precision (FP16)')
+    parser.add_argument('--half', type=str2bool, default=True, help='Export with half precision (FP16)')
     args = parser.parse_args()
 
     main(args)
