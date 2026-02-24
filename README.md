@@ -163,27 +163,22 @@ You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-E
 
 Because the official extraction script relies on PyTorch and OpenCV (which requires specific `C` libraries like `libgl1` and `libglib2.0-0`), we have provided an isolated Dockerfile to generate it reproducibly without clashing with your host system.
 
+### FP16 Export (Default)
+
+The export container now defaults to **half-precision (FP16)** to optimize for file size and ensure hardware translation consistency.
+
 1. Pull or build the exporter image:
 ```bash
 docker pull ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
-# Alternatively, build locally: docker build -t ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 tools/onnx-export/
 ```
 
-2. Run the container, mounting your current directory to extract the output `.onnx` file:
+2. Run the container:
 ```bash
 docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
 ```
 
-This will automatically download the official `.pth` model, execute the trace, and save `realesrgan-x4plus.onnx` into your current directory!
-
-### FP16 Export (Optional)
-
-While TensorRT can build an FP16 engine from a standard FP32 ONNX file (by simply using the `--fp16` build flag), you can also export the ONNX model itself in half-precision. This is sometimes preferred for reducing the `.onnx` file size or avoiding rare precision inconsistencies during hardware translation.
-
-To export in FP16, pass the `--half` flag:
-```bash
-docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 --half
-```
+> [!TIP]
+> **FP32 Export**: If you explicitly require a full-precision (FP32) ONNX model, you can override the default entrypoint flags by omitting the `--half` flag manually or running the script directly.
 
 ### Verification
 To ensure the mathematical graph sequence was exported flawlessly without any hardware translation discrepancies, verify the MD5 checksum of the generated `.onnx` file:
