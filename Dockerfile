@@ -1,5 +1,5 @@
 # --- Stage 1: Build the Go application ---
-FROM nvcr.io/nvidia/tensorrt:26.01-py3 AS builder
+FROM nvcr.io/nvidia/tensorrt:25.01-py3 AS builder
 
 # Install Go and Make
 RUN apt-get update && apt-get install -y wget make && \
@@ -26,7 +26,7 @@ RUN make build
 # --- Stage 2: Create a minimal runtime environment ---
 # We still need the TensorRT and CUDA shared libraries (.so files) at runtime,
 # so we use a runtime TensorRT image rather than a completely empty scratch container
-FROM nvcr.io/nvidia/tensorrt:26.01-py3
+FROM nvcr.io/nvidia/tensorrt:25.01-py3
 
 # Set up working directory for the application
 WORKDIR /app

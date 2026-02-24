@@ -200,6 +200,15 @@ Because this tool relies on the `realesrgan-x4plus` model processing via TensorR
      - **FP32**: Results in a dedicated **~14GB VRAM footprint**.
      - **FP16**: Results in a dedicated **~7GB VRAM footprint**.
 2. **Dimension Tiling**: While other implementations fallback to patching or "tiling" to solve VRAM exhaustions, this pure C++ backend expects the entire activation map locally. Future updates may introduce chunking for massive geometries.
+ 
+
+
+## Troubleshooting
+### CUDA Error 35 (cudaErrorInsufficientDriver)
+If you encounter "Error Code 6: API Usage Error (CUDA initialization failure with error: 35)" or "Unable to determine GPU memory usage", it means your host NVIDIA driver is too old for the CUDA version inside the Docker container.
+**Solutions:**
+1. **Update Host Drivers**: Ensure your NVIDIA drivers are at least **550.x or newer**. This is required for Blackwell (B100) and Hopper (H100) support in the latest containers.
+2. **Downgrade Base Image**: If you cannot update your host drivers (e.g., on a shared cluster), you can modify the `Dockerfile` to use an older base image like `nvcr.io/nvidia/tensorrt:24.01-py3`. Note that this will drop support for Blackwell (sm100) GPUs.
 ## Acknowledgements
 
 This project is a bridge to the TensorRT implementation of Real-ESRGAN. We would like to give full credit to the original authors and the official project:
