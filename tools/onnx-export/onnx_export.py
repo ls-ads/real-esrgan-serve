@@ -1,6 +1,7 @@
-import argparse
 import torch
 import torch.onnx
+import onnx
+from onnxconverter_common import float16
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
 def main(args):
@@ -15,14 +16,9 @@ def main(args):
     model.train(False)
     model.cpu().eval()
 
-    if args.half:
-        model = model.half()
-
     # Dynamic input: batch size, channels, height, width
     # Real-ESRGAN requires static channel dimension (3), but spatial and batch can be dynamic
     x = torch.rand(1, 3, 64, 64)
-    if args.half:
-        x = x.half()
     
     # Export the model
     with torch.no_grad():
@@ -39,10 +35,18 @@ def main(args):
             input_names=['input'],
             output_names=['output']
         )
-    print(torch_out.shape)
+    print(f"Model exported to {args.output}")
+
+    if args.half:
+        print("Converting to half precision (FP16)...")
+        model_fp32 = onnx.load(args.output)
+        model_fp16 = float16.convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, args.output)
+        print("Conversion successful.")
 
 if __name__ == '__main__':
     """Convert pytorch model to onnx models with dynamic axes"""
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--input', type=str, default='weights/RealESRGAN_x4plus.pth', help='Input model path')

@@ -18,7 +18,8 @@ RUN git checkout a4abfb2979a7bbff3f69f58f58ae324608821e27
 
 # Use uv to install dependencies with time-travel resolution
 RUN uv venv && \
-    uv pip install --exclude-newer 2022-09-04T23:59:59Z -r requirements.txt
+    uv pip install --exclude-newer 2022-09-04T23:59:59Z -r requirements.txt && \
+    uv pip install onnx onnxconverter-common
 
 # Download the official RealESRGAN_x4plus weights
 RUN wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P weights
