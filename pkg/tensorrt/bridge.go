@@ -31,13 +31,18 @@ func LoadEngine(enginePath string, gpuID int) (*EngineContext, error) {
 }
 
 // BuildEngineFromONNX builds a TensorRT engine from an ONNX model
-func BuildEngineFromONNX(onnxPath, enginePath string) error {
+func BuildEngineFromONNX(onnxPath, enginePath string, useFP16 bool) error {
 	cOnnxPath := C.CString(onnxPath)
 	cEnginePath := C.CString(enginePath)
 	defer C.free(unsafe.Pointer(cOnnxPath))
 	defer C.free(unsafe.Pointer(cEnginePath))
 
-	res := C.BuildEngineFromONNX(cOnnxPath, cEnginePath)
+	fp16Val := C.int(0)
+	if useFP16 {
+		fp16Val = C.int(1)
+	}
+
+	res := C.BuildEngineFromONNX(cOnnxPath, cEnginePath, fp16Val)
 	if res != 0 {
 		return errors.New("failed to build TensorRT engine from ONNX")
 	}

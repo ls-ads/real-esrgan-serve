@@ -170,7 +170,7 @@ void FreeEngine(EngineContext ctx) {
     delete trt;
 }
 
-int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
+int BuildEngineFromONNX(const char* onnxPath, const char* enginePath, int useFP16) {
     std::cout << "[C++] Building Engine from ONNX: " << onnxPath << std::endl;
 
     // 1. Create Builder and Network
@@ -197,6 +197,15 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     // Set memory pool limit (e.g., 4GB workspace)
     config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, 4ULL << 30);
 
+    if (useFP16) {
+        if (builder->platformHasFastFp16()) {
+            std::cout << "[C++] Enabling FP16 mode." << std::endl;
+            config->setFlag(BuilderFlag::kFP16);
+        } else {
+            std::cerr << "[C++] Warning: Platform does not have fast FP16 support. Falling back to FP32." << std::endl;
+        }
+    }
+
     // 4. Configure Optimization Profile for Dynamic Shapes
     // The provided ONNX trace statically bakes in 1x3x64x64. We must override the input layer bounds.
     IOptimizationProfile* profile = builder->createOptimizationProfile();
@@ -210,7 +219,16 @@ int BuildEngineFromONNX(const char* onnxPath, const char* enginePath) {
     
     config->addOptimizationProfile(profile);
 
-    // 5. Build Serialized Engine
+    // 5. Ensure input/output are Float32 for the wrapper interface compatibility
+    // Even if internal layers are FP16, we want the external buffer to be FP32.
+    for (int i = 0; i < network->getNbInputs(); ++i) {
+        network->getInput(i)->setType(DataType::kFLOAT);
+    }
+    for (int i = 0; i < network->getNbOutputs(); ++i) {
+        network->getOutput(i)->setType(DataType::kFLOAT);
+    }
+
+    // 6. Build Serialized Engine
     std::unique_ptr<IHostMemory> serializedEngine(builder->buildSerializedNetwork(*network, *config));
     if (!serializedEngine) {
         std::cerr << "Engine serialization failed. Check if ONNX model ops are supported." << std::endl;

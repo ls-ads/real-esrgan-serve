@@ -35,7 +35,7 @@ echo "------------------------------------------------------"
 echo "Compiling Engine: $OUT_PATH"
 echo "------------------------------------------------------"
 
-/app/real-esrgan-serve build --onnx /workspace/realesrgan-x4plus.onnx --engine "$OUT_PATH"
+/app/real-esrgan-serve build --onnx /workspace/realesrgan-x4plus.onnx --engine "$OUT_PATH" --fp16
 
 echo "------------------------------------------------------"
 echo "Engine compiled successfully!"

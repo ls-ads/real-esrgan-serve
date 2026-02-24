@@ -17,7 +17,7 @@ int RunInference(EngineContext ctx, const float* input, float* output, int input
 void FreeEngine(EngineContext ctx);
 
 // Build an engine from ONNX
-int BuildEngineFromONNX(const char* onnxPath, const char* enginePath);
+int BuildEngineFromONNX(const char* onnxPath, const char* enginePath, int useFP16);
 
 #ifdef __cplusplus
 }

@@ -82,11 +82,18 @@ curl -k -X POST -F "image=@path/to/image.jpg" "http://localhost:8080/upscale" -o
 You can compile an ONNX model into a hardware-specific TensorRT `.engine` file via the build command:
 
 ```bash
-./real-esrgan-serve build --onnx path/to/model.onnx --engine path/to/model.engine
+./real-esrgan-serve build --onnx path/to/model.onnx --engine path/to/model.engine --fp16
 ```
 
+> [!TIP]
+> **FP16 Recommended**: Building with the `--fp16` flag (enabled by default) enables half-precision optimizations. This significantly reduces the VRAM footprint and improves performance on modern GPUs (Maxwell architecture and newer). 
+> 
+> **Note on ONNX precision**: You do **not** need a half-precision `.onnx` file to build an FP16 engine. TensorRT will automatically cast the internal weights to FP16 during compilation if the `--fp16` flag is provided. However, using a half-precision ONNX file (via the `--half` export flag) is also supported.
+
 > [!CAUTION]
-> **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM) because TensorRT must compile and evaluate multiple tactics for the maximum supported resolution ($1280 \times 1280$). You will need a GPU with **at least 16GB of VRAM** (e.g., RTX 3080 Ti/4080, A4000) to successfully build the engine without hitting an out-of-memory (`UNSUPPORTED_STATE`) error.
+> **VRAM Requirement**: Building the TensorRT `.engine` file from the ONNX model requires significant GPU memory (VRAM). 
+> - **Full Precision (FP32)**: Requires **at least 16GB of VRAM**.
+> - **Half Precision (FP16)**: Requires **at least 8GB of VRAM** (e.g., RTX 3060/4060, A2000).
 
 ### 4. Cloud Engine Builder
 
@@ -167,6 +174,15 @@ docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v
 
 This will automatically download the official `.pth` model, execute the trace, and save `realesrgan-x4plus.onnx` into your current directory!
 
+### FP16 Export (Optional)
+
+While TensorRT can build an FP16 engine from a standard FP32 ONNX file (by simply using the `--fp16` build flag), you can also export the ONNX model itself in half-precision. This is sometimes preferred for reducing the `.onnx` file size or avoiding rare precision inconsistencies during hardware translation.
+
+To export in FP16, pass the `--half` flag:
+```bash
+docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 --half
+```
+
 ### Verification
 To ensure the mathematical graph sequence was exported flawlessly without any hardware translation discrepancies, verify the MD5 checksum of the generated `.onnx` file:
 ```bash
@@ -180,7 +196,9 @@ Because this tool relies on the `realesrgan-x4plus` model processing via TensorR
 
 1. **Memory Ceiling**: All TensorRT context memory linearly correlates with the input image's dimensions. Since the `realesrgan-x4plus` model outputs are exactly 4x the input size in width and height (yielding a $16\times$ larger pixel map overall), large input files will cause drastic spikes in VRAM usage.
    - **Maximum Supported Resolution**: The default TensorRT execution context enforces a strict dynamic bounding box limit of **$1280 \times 1280$**. Any image exceeding these dimensions on either axis will be cleanly rejected by the server prior to processing.
-   - **Inference Footprint (720p Example)**: Because TensorRT statically reserves the required VRAM for its allocated execution profiles, running inference on a standard 720p image (e.g., $1280 \times 720$) will result in a dedicated **~14GB VRAM footprint** on your GPU while the engine is loaded.
+   - **Inference Footprint (720p Example)**: Because TensorRT statically reserves the required VRAM for its allocated execution profiles:
+     - **FP32**: Results in a dedicated **~14GB VRAM footprint**.
+     - **FP16**: Results in a dedicated **~7GB VRAM footprint**.
 2. **Dimension Tiling**: While other implementations fallback to patching or "tiling" to solve VRAM exhaustions, this pure C++ backend expects the entire activation map locally. Future updates may introduce chunking for massive geometries.
 ## Acknowledgements
 
