@@ -48,6 +48,8 @@ echo "------------------------------------------------------"
 # We assume the matching ONNX file is provided in /app
 /app/real-esrgan-serve build --onnx "/app/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" $FP16_FLAG
 
+touch /output/DONE
+
 echo "------------------------------------------------------"
 echo "Engine compiled successfully!"
 echo "Saved to: $OUT_PATH"
