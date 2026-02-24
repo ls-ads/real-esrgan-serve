@@ -28,14 +28,25 @@ ARCH="sm${COMPUTE_CAP//./}"
 echo "Detected GPU Architecture: $ARCH (Compute Capability: $COMPUTE_CAP)"
 
 # 3. Build the Engine
-OUT_NAME="realesrgan-x4plus-${ARCH}-trt${TRT_VER}.engine"
+PRECISION=${PRECISION:-fp16}
+if [ "$PRECISION" = "fp16" ]; then
+    FP16_FLAG="--fp16"
+    SUFFIX="_fp16"
+else
+    # In Cobra, --fp16=false is the way to disable a boolean flag
+    FP16_FLAG="--fp16=false"
+    SUFFIX="_fp32"
+fi
+
+OUT_NAME="realesrgan-x4plus-${ARCH}-trt${TRT_VER}${SUFFIX}.engine"
 OUT_PATH="/output/${OUT_NAME}"
 
 echo "------------------------------------------------------"
-echo "Compiling Engine: $OUT_PATH"
+echo "Compiling Engine ($PRECISION): $OUT_PATH"
 echo "------------------------------------------------------"
 
-/app/real-esrgan-serve build --onnx /workspace/realesrgan-x4plus.onnx --engine "$OUT_PATH" --fp16
+# We assume the matching ONNX file is provided in /workspace
+/app/real-esrgan-serve build --onnx "/workspace/realesrgan-x4plus${SUFFIX}.onnx" --engine "$OUT_PATH" $FP16_FLAG
 
 echo "------------------------------------------------------"
 echo "Engine compiled successfully!"

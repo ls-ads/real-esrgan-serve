@@ -1,10 +1,15 @@
 import torch
 import torch.onnx
 import onnx
+import os
 from onnxconverter_common import float16
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
 def main(args):
+    # Determine output filename based on precision
+    suffix = '_fp16' if args.half else '_fp32'
+    output_path = f"/output/realesrgan-x4plus{suffix}.onnx"
+
     # An instance of the model
     model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
     if args.params:
@@ -25,7 +30,7 @@ def main(args):
         torch_out = torch.onnx._export(
             model, 
             x, 
-            args.output, 
+            output_path, 
             opset_version=14, # TensorRT usually prefers 13 or 14 for stability
             export_params=True,
             dynamic_axes={
@@ -35,13 +40,13 @@ def main(args):
             input_names=['input'],
             output_names=['output']
         )
-    print(f"Model exported to {args.output}")
+    print(f"Model exported to {output_path}")
 
     if args.half:
         print("Converting to half precision (FP16)...")
-        model_fp32 = onnx.load(args.output)
+        model_fp32 = onnx.load(output_path)
         model_fp16 = float16.convert_float_to_float16(model_fp32)
-        onnx.save(model_fp16, args.output)
+        onnx.save(model_fp16, output_path)
         print("Conversion successful.")
 
 if __name__ == '__main__':
@@ -50,7 +55,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--input', type=str, default='weights/RealESRGAN_x4plus.pth', help='Input model path')
-    parser.add_argument('--output', type=str, default='/output/realesrgan-x4plus.onnx', help='Output onnx path')
     parser.add_argument('--params', action='store_false', help='Use params instead of params_ema')
     parser.add_argument('--half', action='store_true', help='Export with half precision (FP16)')
     args = parser.parse_args()

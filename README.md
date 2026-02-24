@@ -110,7 +110,7 @@ docker pull ghcr.io/ls-ads/real-esrgan-serve/engine-build:v0.1.0
 ```
 *(Alternatively, build it locally: `docker build -t engine-build:v0.1.0 tools/engine-build/`)*
 
-When you deploy this image onto any cloud GPU instance, simply mount a persistent volume (or local folder) onto the container's `/output` path. The container will automatically boot up, download the verified `realesrgan-x4plus.onnx` file from the remote Github releases, run the intense C++ engine building process targeting the specific hardware you rented, and safely drop the finished `.engine` file into your mounted folder before exiting.
+When you deploy this image onto any cloud GPU instance, simply mount a persistent volume (or local folder) onto the container's `/output` path. The container will automatically boot up, download the verified `realesrgan-x4plus_fp16.onnx` file from the remote Github releases, run the intense C++ engine building process targeting the specific hardware you rented, and safely drop the finished `.engine` file into your mounted folder before exiting.
 
 **Run the Builder:**
 ```bash
@@ -120,9 +120,9 @@ docker run --rm --gpus all \
 ```
 
 > **Dynamic Naming (`smXX`)**: The container will automatically parse the host's exact compute capability directly from the NVIDIA driver and dynamically name your engine file with the `sm` prefix and TensorRT version. For example:
-> - Building on an **RTX A4000** yields: `realesrgan-x4plus-sm86-trt10.14.engine`
-> - Building on an **RTX 2000 Ada** yields: `realesrgan-x4plus-sm89-trt10.14.engine`
-> - Building on an **H100 PCIe** yields: `realesrgan-x4plus-sm90-trt10.14.engine`
+> - Building on an **RTX A4000** yields: `realesrgan-x4plus-sm86-trt10.14_fp16.engine`
+> - Building on an **RTX 2000 Ada** yields: `realesrgan-x4plus-sm89-trt10.14_fp16.engine`
+> - Building on an **H100 PCIe** yields: `realesrgan-x4plus-sm90-trt10.14_fp16.engine`
 
 ## Docker
 
@@ -156,16 +156,16 @@ docker run -d --gpus all \
 
 ## Generating the ONNX Model
 
-You must generate the ONNX file (`realesrgan-x4.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine. 
+You must generate the ONNX file (`realesrgan-x4plus_fp16.onnx`) from the official `Real-ESRGAN_x4plus.pth` PyTorch weights before building your engine. 
 
 > [!TIP]
-> **Pre-exported Model Available**: We have already exported the standard `realesrgan-x4plus` model to ONNX for you. You can download the verified [realesrgan-x4plus.onnx](https://github.com/ls-ads/real-esrgan-serve/releases/tag/v0.1.0) directly from the GitHub releases page.
+> **Pre-exported Model Available**: We have already exported the standard `realesrgan-x4plus` model to ONNX for you. You can download the verified [realesrgan-x4plus_fp16.onnx](https://github.com/ls-ads/real-esrgan-serve/releases/tag/v0.1.0) directly from the GitHub releases page.
 
 Because the official extraction script relies on PyTorch and OpenCV (which requires specific `C` libraries like `libgl1` and `libglib2.0-0`), we have provided an isolated Dockerfile to generate it reproducibly without clashing with your host system.
 
 ### FP16 Export (Default)
 
-The export container now defaults to **half-precision (FP16)** to optimize for file size and ensure hardware translation consistency.
+The export container now defaults to **half-precision (FP16)** and automatically names the output file with the appropriate precision suffix (`_fp16.onnx` or `_fp32.onnx`).
 
 1. Pull or build the exporter image:
 ```bash
@@ -177,14 +177,18 @@ docker pull ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
 docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0
 ```
 
+This will automatically download the official `.pth` model, execute the trace, and save **`realesrgan-x4plus_fp16.onnx`** into your current directory!
+
 > [!TIP]
-> **FP32 Export**: If you explicitly require a full-precision (FP32) ONNX model, you can override the default entrypoint flags by omitting the `--half` flag manually or running the script directly.
+> **FP32 Export**: If you explicitly require a full-precision (FP32) ONNX model, you can override the default entrypoint flags by running:
+> `docker run --rm -v $(pwd):/output ghcr.io/ls-ads/real-esrgan-serve/onnx-export:v0.1.0 --half=false`
+> (This will generate `realesrgan-x4plus_fp32.onnx`).
 
 ### Verification
 To ensure the mathematical graph sequence was exported flawlessly without any hardware translation discrepancies, verify the MD5 checksum of the generated `.onnx` file:
 ```bash
-$ md5sum realesrgan-x4plus.onnx 
-20eb537004dfed40ff393a89d46c9fb7  realesrgan-x4plus.onnx
+$ md5sum realesrgan-x4plus_fp16.onnx 
+3cc144c87adc6650ba950321a64ff5d9  realesrgan-x4plus_fp16.onnx
 ```
 
 ## Limitations & VRAM
