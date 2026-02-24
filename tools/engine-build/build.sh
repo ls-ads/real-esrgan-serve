@@ -24,8 +24,11 @@ fi
 
 COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1)
 ARCH="sm${COMPUTE_CAP//./}"
+GPU_NAME=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | head -n 1)
+# Sanitize GPU name: lowercase, replace spaces/special chars with hyphens, remove redundant hyphens
+GPU_NAME_SAN=$(echo "$GPU_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\{1,\}/-/g' | sed 's/^-//;s/-$//')
 
-echo "Detected GPU Architecture: $ARCH (Compute Capability: $COMPUTE_CAP)"
+echo "Detected GPU: $GPU_NAME ($ARCH)"
 
 # 3. Build the Engine
 PRECISION=${PRECISION:-fp16}
@@ -38,7 +41,7 @@ else
     SUFFIX="_fp32"
 fi
 
-OUT_NAME="realesrgan-x4plus-${ARCH}-trt${TRT_VER}${SUFFIX}.engine"
+OUT_NAME="realesrgan-x4plus-${GPU_NAME_SAN}-${ARCH}-trt${TRT_VER}${SUFFIX}.engine"
 OUT_PATH="/output/${OUT_NAME}"
 
 echo "------------------------------------------------------"
