@@ -1,13 +1,30 @@
 # Third-party notices and licensing
 
-This project (`real-esrgan-serve`) is licensed under the MIT License
-(see [`LICENSE`](./LICENSE)). It redistributes and depends on a number
-of third-party works, each governed by its own license. This document
-catalogues those dependencies, their licenses, and any obligations
-that flow with their use or redistribution.
+This project (`real-esrgan-serve`) is licensed under the Apache
+License 2.0 (see [`LICENSE`](./LICENSE)). It redistributes and
+depends on a number of third-party works, each governed by its own
+license. This document catalogues those dependencies, their
+licenses, and any obligations that flow with their use or
+redistribution.
+
+When you redistribute this project (in source, binary, or container
+form), Apache 2.0 §4(d) requires you to also redistribute this
+NOTICE file alongside your derivative work.
 
 If you find an attribution missing or incorrect, please open an issue
 or PR.
+
+---
+
+## 0. real-esrgan-serve
+
+Copyright 2026 Andrew Damon-Smith
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
 
 ---
 

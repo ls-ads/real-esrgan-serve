@@ -143,14 +143,18 @@ release workflow on tag push for CI to build + publish.
 
 ## License
 
-This project's own code is MIT — see [`LICENSE`](./LICENSE).
+This project's own code is Apache-2.0 — see [`LICENSE`](./LICENSE).
+The patent-grant + termination clause matters for ML/inference work
+where method patents are not theoretical; the trade-off vs MIT is
+the NOTICE preservation requirement, which we satisfy with
+[`NOTICE.md`](./NOTICE.md).
 
 It redistributes and depends on third-party software (Real-ESRGAN
 weights under BSD-3-Clause, NVIDIA CUDA runtime libraries under the
 NVIDIA EULA, onnxruntime / Pillow / Pydantic / et al under various
 permissive licenses). All attributions, obligations, and redistribution
-rules are catalogued in [`NOTICE.md`](./NOTICE.md), which also ships
-inside the runtime container at `/usr/share/doc/real-esrgan-serve/`.
+rules are catalogued in `NOTICE.md`, which also ships inside the
+runtime container at `/usr/share/doc/real-esrgan-serve/`.
 
 When forking or vendoring this repo, preserve `LICENSE`, `NOTICE.md`,
 and `third-party-licenses/`.
