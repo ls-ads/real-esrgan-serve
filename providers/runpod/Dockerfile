@@ -37,20 +37,16 @@ RUN pip3 install --no-cache-dir \
         "requests==2.32.3" \
     && rm -rf /root/.cache /tmp/*
 
-# Bake the model. COPY runs from the docker build context (repo
-# root), so build/dist/* must exist on the building host.
-#
-# Engine bake intentionally NOT done here yet: the base image is
-# `nvidia/cuda:12.4.1-base` which has libcuda but no cuDNN.
-# onnxruntime-gpu 1.18 requires libcudnn.so.8 to load the
-# TensorRTExecutionProvider, and without TRT EP a `.engine` file is
-# unparseable (not ONNX protobuf). To re-enable the engine path:
-#   1. Switch base to `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`
-#      (or apt-install libcudnn8). cuDNN 9 ships in the modern image,
-#      so also bump onnxruntime-gpu to >=1.20.
-#   2. Re-add `COPY build/dist/*.engine /workspace/` here.
-# Until then handler.py's _resolve_model_path falls through to the
-# .onnx file and runs via CUDA EP — slower first inference but works.
+# Bake the model. Engine artefacts are intentionally NOT copied
+# here — the base image ships without cuDNN to keep cold-start
+# image-pull time down (see ../../Dockerfile header). Without
+# cuDNN, ORT's TRT EP can't load and a baked .engine file is
+# unparseable as ONNX. handler.py's _trt_ep_loadable() probe
+# guards this and falls through to the .onnx via CUDA EP.
+# To re-enable engines: install libcudnn9-cuda-12 in the base
+# Dockerfile and bump onnxruntime-gpu to 1.20.x, then re-add
+#   COPY build/dist/*.engine /workspace/
+# Trade-off documented in ../../Dockerfile header.
 COPY build/dist/realesrgan-x4plus_fp16.onnx /workspace/realesrgan-x4plus_fp16.onnx
 
 WORKDIR /app

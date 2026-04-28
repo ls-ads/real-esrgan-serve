@@ -13,23 +13,29 @@
 # releases. NEVER reshuffle this without re-checking the published
 # image-layer sizes.
 #
-# Sizing breakdown (approximate, ubuntu22.04 + cuda 12.4):
+# Sizing breakdown (approximate, ubuntu22.04 + cuda 12.4 base):
 #   nvidia/cuda:base            ~150 MB   (libcuda.so.1 + nvidia-smi)
-#   python3 + pip + apt-cleaned ~100 MB
-#   numpy + pillow (apt)        ~ 50 MB
-#   onnxruntime-gpu wheel       ~500 MB   (bundles cuDNN, cuBLAS, etc.)
-#   Go binary (CGO=0, stripped) ~ 10 MB
+#   python3 + pip               ~ 80 MB
+#   numpy + pillow (pip wheels) ~ 30 MB
+#   onnxruntime-gpu 1.18 wheel  ~600 MB   (CUDA EP libs)
+#   Go binary (CGO=0, stripped) ~  7 MB
 #   runtime/upscaler.py         < 1 MB
 #   ───────────────────────────────────
-#                       Total   ~810 MB
+#                       Total   ~870 MB
 #
-# Why nvidia/cuda:base and NOT :runtime: the :runtime variant ships
-# the full CUDA runtime (~3.5 GB worth of libs the wheel doesn't
-# need). onnxruntime-gpu's pip wheel bundles its own copies of
-# cuDNN + cuBLAS; we only need libcuda.so.1 from the host (provided
-# by nvidia-container-toolkit at runtime) plus a working python.
-# Validated against onnxruntime-gpu 1.18.x; if a future ORT release
-# starts demanding system CUDA libs, fall back to :runtime here.
+# Why :base + no cuDNN: enabling ORT's TensorRT EP would let us
+# consume pre-compiled .engine artefacts (~30 s → ~0.5 s first
+# request, ~5x warm), but TRT EP needs libcudnn on the linker path
+# AND a matching TensorRT version, AND ORT compiled against both.
+# Concretely, that means upgrading to ORT 1.20.x (cuDNN 9), and
+# apt-installing libcudnn9-cuda-12 (~1 GB by itself — cuDNN 9 is
+# split into libcudnn_engines_precompiled.so etc that bundle CUDA
+# kernels for every supported SM arch). The resulting image lands
+# at ~3.8 GB, more than doubling cold-start image-pull time. Until
+# we can amortize that cost (high-throughput workload, or RunPod's
+# warm-pool feature), we ship CUDA-EP-only — slower per-request
+# but a leaner cold start. Engine artefacts in the provider
+# Dockerfile are gated by handler.py's _trt_ep_loadable() probe.
 #
 # Why pre-baked model on top of an `runtime` layer: Stage A's .onnx
 # (~67 MB FP16 / ~134 MB FP32) is pre-fetched in the provider-
@@ -67,29 +73,28 @@ RUN CGO_ENABLED=0 go build \
 # --- Stage 2: runtime (slim) ────────────────────────────────────────
 FROM nvidia/cuda:12.4.1-base-ubuntu22.04
 
-# Minimal Python + image I/O. apt --no-install-recommends drops
-# ~80 MB of optional Suggests/Recommends. Cleaning apt caches and
-# tmp in the SAME RUN is what keeps the layer thin (a separate `rm`
-# layer would still carry the cache bytes).
+# Minimal Python install. We drop python3-numpy and python3-pil
+# from apt (saves ~50 MB vs the previous shape) — both come in via
+# pip wheels below. apt's Pillow also links a wider set of system
+# codecs we don't use, so the pip wheel is leaner.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
-        python3-numpy \
-        python3-pil \
         ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
 
-# onnxruntime-gpu pinned to a CUDA-12-compatible release. The wheel
-# bundles cuDNN + the TensorRT EP; first-use compilation produces a
-# cached engine under XDG_CACHE_HOME (mount a volume there in
-# production to survive container churn).
-#
-# `--no-deps --no-cache-dir` is deliberate: numpy is already
-# installed via apt, and pip's cache adds ~200 MB to the layer if
-# left enabled.
-RUN pip3 install --no-cache-dir --no-deps onnxruntime-gpu==1.18.1 \
+# onnxruntime-gpu provides the CUDA EP we use here. The TRT EP is
+# also bundled but won't load without libcudnn — see the header
+# comment for why we don't ship cuDNN. Pillow + numpy are pulled in
+# explicitly because we dropped python3-numpy/pil from apt above;
+# --no-deps keeps the layer from accidentally picking up TensorRT's
+# pip wheel (~2 GB) or other system-provided GPU libs.
+RUN pip3 install --no-cache-dir --no-deps \
+        onnxruntime-gpu==1.18.1 \
+        numpy==1.26.4 \
+        Pillow==10.4.0 \
     && rm -rf /root/.cache /tmp/*
 
 # Late-arriving artefacts (small, change every build) ────────────────
