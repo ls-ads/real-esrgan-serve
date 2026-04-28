@@ -1,14 +1,13 @@
-// Package modelfetch implements `fetch-model`: pull a verified model
-// artefact from GitHub Releases, check its SHA-256 against the
-// repo's `models/MANIFEST.json`, and place it under the user's cache
-// dir.
+// Package modelfetch implements `fetch-model`: pull a verified ONNX
+// model from GitHub Releases, check its SHA-256 against the repo's
+// `models/MANIFEST.json`, and place it under the user's cache dir.
 //
 // Why bother with a manifest:
 //
-//	The previous version of this repo carried `realesrgan-x4plus_fp16.onnx`
-//	and a pre-baked TensorRT `.engine` blob committed in-tree (~hundreds
-//	of MB). That bloated `git clone`, blocked Apache-2.0 redistribution
-//	(some weights have separate licences), and gave us no way to ship
+//	The previous version of this repo carried weights and pre-baked
+//	per-GPU artefacts committed in-tree (hundreds of MB). That
+//	bloated `git clone`, blocked Apache-2.0 redistribution (some
+//	weights have separate licences), and gave us no way to ship
 //	updated weights without a new release. The new shape:
 //
 //	  1. Weights live in GH Releases of this repo (`v0.X.Y`).
@@ -55,27 +54,24 @@ type Manifest struct {
 }
 
 type Model struct {
-	Name        string `json:"name"`
-	Variant     string `json:"variant"`
-	GPUClass    string `json:"gpu_class,omitempty"`
-	TRTVersion  string `json:"trt_version,omitempty"`
-	Filename    string `json:"filename"`
-	URL         string `json:"url"`
-	SHA256      string `json:"sha256"`
-	Bytes       int64  `json:"bytes"`
-	License     string `json:"license"`
-	LicenseURL  string `json:"license_url"`
-	Notes       string `json:"notes,omitempty"`
+	Name       string `json:"name"`
+	Variant    string `json:"variant"`
+	Filename   string `json:"filename"`
+	URL        string `json:"url"`
+	SHA256     string `json:"sha256"`
+	Bytes      int64  `json:"bytes"`
+	License    string `json:"license"`
+	LicenseURL string `json:"license_url"`
+	Notes      string `json:"notes,omitempty"`
 }
 
 type opts struct {
-	name      string
-	variant   string
-	gpuClass  string
-	dest      string
-	manifest  string
-	noVerify  bool
-	jsonEvts  bool
+	name     string
+	variant  string
+	dest     string
+	manifest string
+	noVerify bool
+	jsonEvts bool
 }
 
 // Command returns the Cobra command tree for `fetch-model`.
@@ -92,8 +88,6 @@ and caches under $XDG_CACHE_HOME/real-esrgan-serve/models (or
 Variants:
   --variant fp16    smaller, faster; default
   --variant fp32    higher precision; baseline
-  --variant engine  pre-compiled TensorRT engine for a specific GPU class
-                    (requires --gpu-class)
 
 If a model file is already present and matches the manifest hash,
 fetch-model returns immediately without re-downloading.`,
@@ -104,8 +98,7 @@ fetch-model returns immediately without re-downloading.`,
 
 	f := cmd.Flags()
 	f.StringVar(&o.name, "name", "realesrgan-x4plus", "Model name as listed in MANIFEST.json")
-	f.StringVar(&o.variant, "variant", "fp16", "Variant: fp16 | fp32 | engine")
-	f.StringVar(&o.gpuClass, "gpu-class", "", "GPU class for engine variant (e.g. rtx-4090, a40)")
+	f.StringVar(&o.variant, "variant", "fp16", "Variant: fp16 | fp32")
 	f.StringVar(&o.dest, "dest", "", "Override cache destination (default: XDG cache dir)")
 	f.StringVar(&o.manifest, "manifest", "", "Override manifest path (default: built-in / repo-relative)")
 	f.BoolVar(&o.noVerify, "no-verify", false, "Skip SHA-256 verification — DANGEROUS, dev only")
@@ -120,7 +113,7 @@ func run(o *opts) error {
 		return fmt.Errorf("manifest: %w", err)
 	}
 
-	entry, err := mf.Find(o.name, o.variant, o.gpuClass)
+	entry, err := mf.Find(o.name, o.variant)
 	if err != nil {
 		return err
 	}
@@ -227,35 +220,16 @@ func loadManifest(override string) (*Manifest, error) {
 	return &m, nil
 }
 
-// Find picks the manifest entry matching name+variant (and gpu_class
-// when variant is "engine").
-func (m *Manifest) Find(name, variant, gpuClass string) (*Model, error) {
-	var best *Model
+// Find picks the manifest entry matching name+variant.
+func (m *Manifest) Find(name, variant string) (*Model, error) {
 	for i := range m.Models {
 		e := &m.Models[i]
-		if e.Name != name || e.Variant != variant {
-			continue
+		if e.Name == name && e.Variant == variant {
+			return e, nil
 		}
-		if variant == "engine" {
-			if gpuClass == "" {
-				return nil, fmt.Errorf("--gpu-class required when --variant engine")
-			}
-			if e.GPUClass != gpuClass {
-				continue
-			}
-		}
-		best = e
-		break
 	}
-	if best == nil {
-		hint := ""
-		if variant == "engine" {
-			hint = fmt.Sprintf(" (gpu-class=%s)", gpuClass)
-		}
-		return nil, fmt.Errorf("no manifest entry for name=%s variant=%s%s — available: %s",
-			name, variant, hint, m.summarise())
-	}
-	return best, nil
+	return nil, fmt.Errorf("no manifest entry for name=%s variant=%s — available: %s",
+		name, variant, m.summarise())
 }
 
 func (m *Manifest) summarise() string {
@@ -267,10 +241,6 @@ func (m *Manifest) summarise() string {
 		sb.WriteString(e.Name)
 		sb.WriteString("/")
 		sb.WriteString(e.Variant)
-		if e.GPUClass != "" {
-			sb.WriteString("@")
-			sb.WriteString(e.GPUClass)
-		}
 	}
 	return sb.String()
 }

@@ -10,14 +10,13 @@
 //  5. Pipe stdout (JSON events when --json-events) and stderr through
 //  6. Exit with the helper's exit code
 //
-// The subprocess boundary is deliberate. Going through CGO to a C++
-// TensorRT engine (the previous implementation) coupled the Go
-// release to a specific CUDA/TensorRT ABI and forced the user to
-// install nvcr.io/nvidia/tensorrt — license-tangled. A subprocess
-// to Python lets us cross-compile the Go binary with `GOOS=darwin
-// GOARCH=arm64 go build` and ship one tarball per platform; the
-// runtime requirement (Python + onnxruntime) is what the install
-// script + Dockerfile provide.
+// The subprocess boundary is deliberate. The previous version went
+// through CGO to a C++ engine, coupling the Go release to a specific
+// CUDA ABI and forcing the user to install nvcr.io/nvidia/tensorrt
+// — license-tangled. A subprocess to Python lets us cross-compile
+// the Go binary with `GOOS=darwin GOARCH=arm64 go build` and ship
+// one tarball per platform; the runtime requirement (Python +
+// onnxruntime) is what the install script + Dockerfile provide.
 package upscale
 
 import (

@@ -66,9 +66,9 @@ base64 in the response body.
 
 The pre-fetched `.onnx` lives in the image (so no network at boot).
 The helper starts in `--serve` mode and emits `{"event":"ready"}`
-once onnxruntime has loaded the model + warmed up TensorRT EP if
-present. The handler waits for that signal before declaring itself
-healthy to RunPod.
+once onnxruntime has loaded the model into a CUDA EP session. The
+handler waits for that signal before declaring itself healthy to
+RunPod.
 
 For sustained workloads, prefer this template over the one-shot
 `real-esrgan-serve upscale` invocation: the engine stays warm across

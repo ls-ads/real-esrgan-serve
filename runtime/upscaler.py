@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-ESRGAN inference helper — invoked as a subprocess by real-esrgan-serve.
 
-This is the only place ONNX/TensorRT model loading lives. The Go CLI
+This is the only place ONNX model loading lives. The Go CLI
 subprocesses here for both:
 
   * `real-esrgan-serve upscale ...` — one-shot mode (this script
@@ -9,11 +9,10 @@ subprocesses here for both:
   * `real-esrgan-serve serve` — daemon mode (the Go server spawns
     this once and feeds JSONL frames over stdin; see --serve flag)
 
-Why Python and not Go: onnxruntime's Python bindings are the most
-mature path to TensorRT execution-provider, CUDA EP fallback, and the
-preprocessing/postprocessing primitives. The Go-CGO option ties the
-release to specific CUDA/cuDNN/TensorRT ABIs, which is exactly the
-distribution friction the rebuild is meant to remove.
+Why Python and not Go: onnxruntime's Python bindings expose CUDA
+EP + CPU fallback through a stable interface. The Go-CGO ONNX
+binding option would re-tie the release to specific CUDA ABIs,
+which is exactly the distribution friction the rebuild removes.
 
 I/O contract:
 
@@ -45,7 +44,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -84,30 +82,11 @@ def _load_session(model_path: Path, gpu_id: int, json_events: bool):
 
     available = ort.get_available_providers()
     providers: list = []
-    if gpu_id >= 0:
-        # Prefer TensorRT EP on the configured GPU; fall back to CUDA
-        # EP; finally CPU. Each EP gets its options dict so we control
-        # device assignment + cache paths centrally.
-        if "TensorrtExecutionProvider" in available:
-            providers.append((
-                "TensorrtExecutionProvider",
-                {
-                    "device_id": gpu_id,
-                    "trt_fp16_enable": True,
-                    # Engine cache lets repeat runs skip recompilation
-                    "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": str(
-                        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-                        / "real-esrgan-serve"
-                        / "trt-cache"
-                    ),
-                },
-            ))
-        if "CUDAExecutionProvider" in available:
-            providers.append((
-                "CUDAExecutionProvider",
-                {"device_id": gpu_id},
-            ))
+    if gpu_id >= 0 and "CUDAExecutionProvider" in available:
+        providers.append((
+            "CUDAExecutionProvider",
+            {"device_id": gpu_id},
+        ))
     providers.append("CPUExecutionProvider")
 
     session_options = ort.SessionOptions()

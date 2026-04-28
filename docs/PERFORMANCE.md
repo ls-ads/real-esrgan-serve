@@ -3,20 +3,24 @@
 The hosted iosuite.io service spends real money on GPU workers, and
 self-hosters with a single 4090 want every drop of throughput. This
 doc captures the optimisation strategies the rebuild is structured to
-support — most are stubs in the current scaffold and will be filled in
-as we land each piece.
+support.
 
 ## Strategies
 
-### 1. TensorRT execution provider via onnxruntime
+### 1. CUDA execution provider via onnxruntime
 
-`runtime/upscaler.py` requests the TensorRT EP first, falls back to
-CUDA EP, finally CPU EP. When TRT is available, onnxruntime compiles
-the ONNX graph into a TRT engine on first use and caches the result
-under `$XDG_CACHE_HOME/real-esrgan-serve/trt-cache/`. Subsequent runs
-load the cached engine in seconds rather than rebuilding (~30s).
+`runtime/upscaler.py` requests the `CUDAExecutionProvider` when a GPU
+is available, falls back to `CPUExecutionProvider` otherwise. ONNX
++ CUDA EP gives us a stable, cuDNN-free runtime path that doesn't
+balloon the image with multi-gigabyte tensor libraries.
 
-### 2. Eager engine load on `serve` start
+The TensorRT EP path was investigated and rejected during the
+rebuild — see `Dockerfile` header for the math. Short version:
+~5x warm-exec speedup needs ~1 GB of cuDNN runtime libraries, which
+more than doubles cold-start image-pull time. At our throughput
+profile (cold start dominates), that's a net loss.
+
+### 2. Eager session load on `serve` start
 
 `serve` mode runs `upscaler.py --serve`, which loads the model
 session before signalling `{"event":"ready"}` over stdout. The Go
@@ -28,8 +32,8 @@ the first end-user request never pays the warmup cost.
 The Go server holds one helper subprocess and one shared stdin lock.
 N concurrent HTTP handlers serialise their JSONL frames over that
 stdin, then wait on a per-job-ID result channel populated by a single
-stdout reader goroutine. One TRT engine, no per-request session
-spin-up, no GPU contention from multiple processes.
+stdout reader goroutine. One session, no per-request spin-up, no GPU
+contention from multiple processes.
 
 ### 4. Lazy weight unload after idle
 
@@ -38,29 +42,20 @@ Opt-in `--idle-unload <duration>` flag (planned) frees the session
 after N minutes of inactivity, useful on hosts that share the GPU
 with other workloads.
 
-### 5. Pre-baked engines per GPU class
-
-For RunPod-class hosts we know in advance, GitHub Releases ship
-pre-compiled `.engine` files (e.g. `realesrgan-x4plus-rtx-4090-sm89-trt10.8_fp16.engine`).
-`fetch-model --variant engine --gpu-class rtx-4090` pulls the matching
-engine, skipping the ~30s onnxruntime first-build entirely. If no
-engine matches the host's GPU, we fall back to the `.onnx` and let
-TRT EP build + cache locally.
-
 ## Measured numbers
 
-UAT load tests (RTX 4090 on RunPod, realesrgan-x4plus, prod-sized
-1280×1280 inputs):
+RunPod RTX 4090 (ADA_24 pool), realesrgan-x4plus FP16 ONNX,
+64×64 → 256×256 test input, ONNX + CUDA EP:
 
-| Mode                                    | First-request | Steady-state RPS | Cost/req (4090) |
-|-----------------------------------------|---------------|------------------|-----------------|
-| `upscale` (subprocess, cold)            | ~30s          | n/a              | n/a             |
-| `serve` (warm, .onnx + JIT)             | ~7.8s         | ~23 jobs/min     | ~$0.0007        |
-| `serve` (warm, pre-baked .engine)       | ~0.5s         | ~23 jobs/min     | ~$0.0007        |
+| Mode                                    | Latency      | Notes                       |
+|-----------------------------------------|--------------|-----------------------------|
+| Cold start (full e2e)                   | ~46.0 s      | 45.2 s pull, 0.4 s exec     |
+| Warm exec (CUDA EP, p50 over 5 jobs)    | ~423 ms      | walltime ~770 ms incl queue |
 
-Underlying runs are in the iosuite.io repo:
-`load/results/upscale-stress-*.md`. Numbers are end-to-end including
-RunPod queue + network round-trip, not just GPU time.
+Cold start is dominated by image pull (1.6 GB). Warm exec is
+dominated by Real-ESRGAN's compute itself; CUDA EP doesn't add
+meaningful overhead. UAT load-test data on prod-sized 1280×1280
+inputs is in the iosuite.io repo: `load/results/upscale-stress-*.md`.
 
 ## Open optimisations
 
@@ -75,3 +70,8 @@ RunPod queue + network round-trip, not just GPU time.
   upscaled output dominates per-request CPU time. Encoding on a
   worker thread while the GPU starts the next job would overlap the
   cost.
+- **Image slim** — the 1.6 GB image is dominated by ORT's wheel
+  (~600 MB) and runpod SDK's transitive deps (~165 MB,
+  fastapi[all]/boto3/paramiko/sentry-sdk). A `runpod --no-deps` +
+  explicit minimal install could save ~80 MB, cutting cold-start
+  pull time another ~5%.

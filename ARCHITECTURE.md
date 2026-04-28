@@ -87,7 +87,6 @@ keeps the ORT session warm across requests.
 real-esrgan-serve fetch-model \
   --name <name>      # required; e.g. realesrgan-x4plus
   --variant <type>   # fp16|fp32; default: fp16
-  --gpu-class <id>   # optional; for GPU-specific .engine artifacts
   --dest <path>      # default: ~/.cache/real-esrgan-serve/models
 ```
 
@@ -110,10 +109,10 @@ Reasons:
   implementation (immature).
 - Subprocess boundary = process isolation. A model crash takes down
   the helper, not the Go CLI. iosuite's wrapper logic stays unchanged.
-- Future TensorRT path: same Python helper detects the TRT engine
-  variant, uses TRT execution provider when available, falls back to
-  CUDA EP otherwise. Engine compilation moves to the provider deploy
-  step (per-GPU-class build, cached in the container image).
+- Execution provider: `CUDAExecutionProvider` for GPU, `CPUExecutionProvider`
+  fallback. The TensorRT path was investigated and rejected — it
+  doubles image size (cuDNN ~1 GB) without meaningful warm-exec
+  wins at our throughput.
 
 ## Provider templates
 
@@ -131,10 +130,9 @@ local and provider runs.
 
 ## Model artifact contract
 
-- All artifacts live in GitHub Releases: `realesrgan-x4plus-fp16.onnx`,
-  `realesrgan-x4plus-fp32.onnx`, optionally pre-compiled
-  `realesrgan-x4plus-<gpu-class>-<trt-version>-fp16.engine` per
-  popular GPU class.
+- All artifacts live in GitHub Releases: `realesrgan-x4plus-fp16.onnx`
+  and `realesrgan-x4plus-fp32.onnx`. ONNX-only — no per-GPU
+  pre-compiled binaries to maintain.
 - `models/MANIFEST.json` in the repo lists every supported artifact,
   its SHA-256, the GitHub Release URL, the model card.
 - `fetch-model` reads the manifest, downloads, verifies, places.
@@ -147,38 +145,32 @@ local and provider runs.
 The pipeline lives under [`build/`](./build/) and is reproducible
 from upstream `.pth` weights:
 
-- **Stage A** (`build/export_onnx.py`) — CPU-only PyTorch trace from
-  the upstream Real-ESRGAN `.pth` to `.onnx`. Pinned upstream URL +
+- **`build/export_onnx.py`** — CPU-only PyTorch trace from the
+  upstream Real-ESRGAN `.pth` to `.onnx`. Pinned upstream URL +
   SHA-256, fixed opset, fixed dynamic-shape spec → byte-identical
-  output across runs.
-- **Stage B** (`build/compile_engine.py`) — runs on the target GPU,
-  compiles the `.onnx` into a TensorRT engine pinned to that GPU's
-  SM architecture + the host's TRT version. CI matrices over GPU
-  classes; humans run it ad-hoc to add a class.
+  output across runs. Runs in a deps-frozen container
+  (`build/Dockerfile.export`); see `build/README.md` for why.
 - **Manifest sync** (`build/update_manifest.py`) — recomputes
   SHA-256 + size for every artefact in `build/dist/` and writes
   back to `models/MANIFEST.json`. `--check` mode (used in CI) exits
   non-zero on drift without modifying anything.
 
 Releases are cut by tagging `v*` — `.github/workflows/release.yml`
-runs both stages, uploads to the GitHub Release, and opens a PR with
+runs the export, uploads to the GitHub Release, and opens a PR with
 the manifest update. See `build/README.md` for the full walkthrough.
 
 ## Cold-start optimisation (server mode)
 
-The 4090-class workers spend most of their first request paying
-TensorRT engine setup cost (~30s). After warmup, per-request latency
-drops to a few hundred ms. Strategies:
+Cold start on serverless GPU providers is dominated by image pull
+(~1.6 GB → ~45 s on RunPod). Container start + ORT model load
+together are <1 s on RTX 4090. Strategies:
 
-1. **Eager engine load on `serve` start** — first request pays no
-   warmup cost.
-2. **TensorRT execution provider preferred when available** — falls
-   back to CUDA EP cleanly. Detected via `onnxruntime.get_available_providers()`.
-3. **Single ORT session, multiple goroutines** — the Go server holds
+1. **Eager session load on `serve` start** — first request pays no
+   warmup cost beyond ORT's CUDA initialization (~hundreds of ms).
+2. **Single ORT session, multiple goroutines** — the Go server holds
    one Python helper subprocess in serve mode and pipes inference
-   requests over stdin/stdout (or a Unix socket). One TRT engine,
-   N concurrent senders.
-4. **Lazy weight unload after idle** — opt-in. Default keeps weights
+   requests over stdin/stdout. One session, N concurrent senders.
+3. **Lazy weight unload after idle** — opt-in. Default keeps weights
    resident.
 
 ## Contract with iosuite CLI

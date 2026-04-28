@@ -19,10 +19,10 @@ providers/<name>/
 Every provider handler must:
 
 1. **Reuse `runtime/upscaler.py`** — don't reimplement inference.
-   The Python helper handles ONNX/TRT EP selection, model loading,
-   pre/post-processing, and emits standard `{event,id,...}` JSONL.
-   Provider handlers translate the platform's job shape to/from
-   helper frames.
+   The Python helper handles ONNX session loading, CUDA EP / CPU EP
+   selection, pre/post-processing, and emits standard
+   `{event,id,...}` JSONL. Provider handlers translate the
+   platform's job shape to/from helper frames.
 
 2. **Warm the helper once per container / pod / worker.** Spawn it
    in `--serve` mode, wait for `{"event":"ready"}`, then accept jobs.

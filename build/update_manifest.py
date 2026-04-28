@@ -71,7 +71,7 @@ def main() -> int:
             changed = True
 
     extras = sorted(p.name for p in DIST.iterdir()
-                    if p.is_file() and p.name not in seen and p.suffix in (".onnx", ".engine"))
+                    if p.is_file() and p.name not in seen and p.suffix == ".onnx")
     if extras:
         print(f"\n[manifest] artefacts in dist/ with no manifest entry: {extras}")
         print("    add a manifest entry for each before publishing.")

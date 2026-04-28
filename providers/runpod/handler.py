@@ -1,12 +1,11 @@
 """RunPod serverless handler for real-esrgan-serve.
 
-Folded in from the previous runpod-real-esrgan repo and rewritten
-against the new architecture. The previous version spawned the old
-Go HTTP server (which carried the CGO TensorRT bridge) and POSTed
-jobs to it. The new version cuts the middle layer:
+Folded in from the previous runpod-real-esrgan repo. The previous
+version spawned a Go HTTP server (with a CGO TensorRT bridge) and
+POSTed jobs to it. The new version cuts the middle layer:
 
   * On container start: warm up `runtime/upscaler.py --serve` once
-    (eager onnxruntime session load with TRT EP if available).
+    (eager onnxruntime session load via CUDA EP).
   * Per RunPod job: write a JSONL frame to the helper's stdin, read
     one JSONL result frame from stdout.
   * Job input shape unchanged (image_url | image_base64 | image_path)
@@ -27,7 +26,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -79,42 +77,11 @@ class InputPayload(BaseModel):
 # ───────────────────────────────────────────────────────────────────────
 # Model resolution: which .onnx do we serve?
 # ───────────────────────────────────────────────────────────────────────
-def _gpu_arch_tag() -> str:
-    """Return e.g. "sm89" for an RTX 4090; "unknown" if nvidia-smi missing."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            text=True,
-            timeout=5,
-        ).strip().split("\n")[0]
-        return "sm" + out.replace(".", "")
-    except (subprocess.SubprocessError, FileNotFoundError) as e:
-        log.warn(f"nvidia-smi probe failed: {e}")
-        return "unknown"
-
-
-def _trt_ep_loadable() -> bool:
-    """ORT's TensorRT EP needs libcudnn.so.8 dlopen-able. Without it,
-    loading a `.engine` file via TRT EP fails, ORT silently falls back
-    to CUDA EP, and CUDA EP then can't parse the .engine (not ONNX).
-    Probing here lets _resolve_model_path skip the engine path on
-    images that don't ship cuDNN, avoiding a hard handler crash."""
-    import ctypes
-    try:
-        ctypes.CDLL("libcudnn.so.8")
-        return True
-    except OSError:
-        return False
-
-
 def _resolve_model_path() -> Path:
     """Pick the model file to serve. Order:
        1. $REAL_ESRGAN_MODEL — explicit override
-       2. Per-GPU pre-compiled .engine matching this host's GPU class
-          (skips ~30s TRT engine compile on first request)
-       3. .onnx fallback baked into the image (TRT JIT-compiles on
-          first request, ~30s, then caches under XDG)
-       4. fetch-model invocation as a last resort (network-bound,
+       2. .onnx baked into the image at /workspace
+       3. fetch-model invocation as a last resort (network-bound,
           assumes a published release exists)
     """
     explicit = os.environ.get("REAL_ESRGAN_MODEL")
@@ -122,23 +89,9 @@ def _resolve_model_path() -> Path:
         log.info(f"using REAL_ESRGAN_MODEL={explicit}")
         return Path(explicit)
 
-    # Look for a pre-compiled .engine for this GPU class. Filename
-    # convention is `realesrgan-x4plus-<gpu-class>-<sm>-trt<X.Y>_fp16.engine`
-    # — see build/compile_engine.py. We match SM arch (most reliable
-    # ID for engine compatibility) over the human GPU class string.
-    arch = _gpu_arch_tag()  # e.g. "sm89"
-    if arch != "unknown" and _trt_ep_loadable():
-        engines = sorted(WORKSPACE.glob(f"*{arch}*.engine"))
-        if engines:
-            log.info(f"using pre-compiled engine for {arch}: {engines[0].name}")
-            return engines[0]
-    elif arch != "unknown":
-        log.info(f"engine path skipped — libcudnn.so.8 not present, "
-                 f"TRT EP would fail to load")
-
     onnx = WORKSPACE / "realesrgan-x4plus_fp16.onnx"
     if onnx.exists():
-        log.info(f"no engine for {arch} — falling back to onnx (first request will JIT-compile a TRT engine)")
+        log.info(f"using baked onnx: {onnx.name}")
         return onnx
 
     log.warn("model not pre-cached in image — invoking fetch-model (network)")

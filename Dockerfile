@@ -23,22 +23,18 @@
 #   ───────────────────────────────────
 #                       Total   ~870 MB
 #
-# Why :base + no cuDNN: enabling ORT's TensorRT EP would let us
-# consume pre-compiled .engine artefacts (~30 s → ~0.5 s first
-# request, ~5x warm), but TRT EP needs libcudnn on the linker path
-# AND a matching TensorRT version, AND ORT compiled against both.
-# Concretely, that means upgrading to ORT 1.20.x (cuDNN 9), and
-# apt-installing libcudnn9-cuda-12 (~1 GB by itself — cuDNN 9 is
-# split into libcudnn_engines_precompiled.so etc that bundle CUDA
-# kernels for every supported SM arch). The resulting image lands
-# at ~3.8 GB, more than doubling cold-start image-pull time. Until
-# we can amortize that cost (high-throughput workload, or RunPod's
-# warm-pool feature), we ship CUDA-EP-only — slower per-request
-# but a leaner cold start. Engine artefacts in the provider
-# Dockerfile are gated by handler.py's _trt_ep_loadable() probe.
+# We run ONNX-only via ORT's CUDAExecutionProvider — no TensorRT,
+# no cuDNN, no per-GPU engine compilation. Earlier iterations
+# explored a TRT-EP path for ~5x warm-exec speedup, but enabling it
+# requires libcudnn (~1 GB on its own — cuDNN 9 is split into
+# per-arch precompiled kernel libraries) and lifts the image past
+# 3.5 GB, more than doubling cold-start image-pull time. The
+# trade-off doesn't pay back at our throughput; if it ever does,
+# it's a contained re-enable (cuDNN install + ORT bump + restore
+# the engine COPY in providers/runpod/Dockerfile).
 #
-# Why pre-baked model on top of an `runtime` layer: Stage A's .onnx
-# (~67 MB FP16 / ~134 MB FP32) is pre-fetched in the provider-
+# Why pre-baked model on top of an `runtime` layer: the .onnx
+# (~33 MB FP16 / ~67 MB FP32) is pre-fetched in the provider-
 # specific Dockerfile (e.g. providers/runpod/Dockerfile), NOT here,
 # so the base image stays useful for non-RunPod consumers who fetch
 # their own weights. Provider images add the model on top, which is
@@ -85,12 +81,10 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
 
-# onnxruntime-gpu provides the CUDA EP we use here. The TRT EP is
-# also bundled but won't load without libcudnn — see the header
-# comment for why we don't ship cuDNN. Pillow + numpy are pulled in
-# explicitly because we dropped python3-numpy/pil from apt above;
-# --no-deps keeps the layer from accidentally picking up TensorRT's
-# pip wheel (~2 GB) or other system-provided GPU libs.
+# onnxruntime-gpu provides the CUDA EP we use for inference. Pillow
+# + numpy are pulled in explicitly because we dropped python3-numpy
+# /pil from apt above; --no-deps keeps the layer from picking up
+# unused GPU libs (e.g. TensorRT's ~2 GB pip wheel).
 RUN pip3 install --no-cache-dir --no-deps \
         onnxruntime-gpu==1.18.1 \
         numpy==1.26.4 \
@@ -102,10 +96,10 @@ COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
 COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
 RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
 
-# Cache dirs. /var/cache/real-esrgan-serve/ holds fetched .onnx +
-# TRT engine cache. Mount a persistent volume here in providers
-# (RunPod Network Volume, K8s PVC, etc.) so engine compilation is
-# paid once per GPU class and survives container restarts.
+# Cache dirs. /var/cache/real-esrgan-serve/ holds fetched .onnx
+# weights. Mount a persistent volume here in providers (RunPod
+# Network Volume, K8s PVC, etc.) so an out-of-image fetch survives
+# container restarts.
 ENV XDG_CACHE_HOME=/var/cache \
     REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py
 

@@ -7,13 +7,13 @@
 //	serve       — long-lived HTTP daemon for hot-path / batch workloads
 //	fetch-model — pull verified model artefacts from GitHub Releases
 //
-// The Go binary is a thin orchestrator. The actual ONNX/TensorRT
-// inference is delegated to the Python runtime helper (subprocess
-// boundary keeps the Go side pure-Go cross-compilable, isolates GPU
-// crashes, and avoids the CGO TensorRT bridge that the previous
-// version of this repo carried). The binary's only runtime
-// requirement is "a working Python install with onnxruntime"; we
-// check for it and fail loudly if missing.
+// The Go binary is a thin orchestrator. The actual ONNX inference
+// is delegated to the Python runtime helper (subprocess boundary
+// keeps the Go side pure-Go cross-compilable, isolates GPU crashes,
+// and avoids the CGO bridge the previous version of this repo
+// carried). The binary's only runtime requirement is "a working
+// Python install with onnxruntime"; we check for it and fail loudly
+// if missing.
 package main
 
 import (

@@ -79,7 +79,7 @@ docker run --rm --gpus all \
 |----------------------------------|----------------------------------------------------------------|
 | `real-esrgan-serve upscale`      | One-shot inference. Subprocesses to the Python runtime.        |
 | `real-esrgan-serve serve`        | Long-lived HTTP daemon — keeps the ORT session warm.           |
-| `real-esrgan-serve fetch-model`  | Pull a verified `.onnx` (or pre-compiled `.engine`) artefact.  |
+| `real-esrgan-serve fetch-model`  | Pull a verified `.onnx` artefact from GitHub Releases.         |
 
 Run `real-esrgan-serve <cmd> --help` for the full flag surface.
 
@@ -101,17 +101,18 @@ In progress:
 
 For the hosted iosuite.io service, the cost lever is concurrent
 throughput on a single GPU. Strategies live in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md): TensorRT EP via
-onnxruntime, eager engine load on `serve` start, single-session
-multi-goroutine fan-in, lazy weight unload.
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md): warm `serve` mode
+with one ORT session per worker, single-session multi-goroutine
+fan-in, lazy weight unload.
 
-Cold-start numbers from the iosuite.io UAT load tests (RTX 4090,
-realesrgan-x4plus, prod-sized 1280×1280 inputs):
+Cold-start numbers from a RunPod RTX 4090 ADA_24 deploy
+(realesrgan-x4plus FP16 ONNX, 64×64 → 256×256 test input,
+ONNX + CUDA EP):
 
-| Mode                                    | First-request latency | Steady-state RPS |
-|-----------------------------------------|-----------------------|------------------|
-| `upscale` (subprocess, cold session)    | ~30s                  | n/a (one-shot)   |
-| `serve` (warm session)                  | ~7.8s                 | ~23 jobs/min     |
+| Mode                                    | Latency               | Notes                  |
+|-----------------------------------------|-----------------------|------------------------|
+| Cold start (full e2e)                   | ~46 s                 | dominated by image pull|
+| Warm exec (CUDA EP)                     | ~400 ms               | p50 across 5 jobs      |
 
 ## Repo layout
 
@@ -124,22 +125,21 @@ real-esrgan-serve/
 │   ├── server/              HTTP daemon mode
 │   ├── modelfetch/          GH-Releases-backed fetch + SHA-256 verify
 │   └── runtime/             helper-locator + invocation primitives
-├── runtime/upscaler.py      Python helper (onnxruntime / TRT EP)
+├── runtime/upscaler.py      Python helper (onnxruntime + CUDA EP)
 ├── providers/
 │   └── runpod/              RunPod serverless template
-├── build/                   .pth → .onnx → .engine pipeline (producer side)
+├── build/                   .pth → .onnx pipeline (producer side)
 ├── models/MANIFEST.json     model artefact registry (URL + SHA-256)
 └── docs/                    PERFORMANCE.md, PROVIDER-GUIDE.md, ...
 ```
 
 ## Building the model artefacts yourself
 
-The `.onnx` and `.engine` files served via GitHub Releases are
-reproducible from upstream Real-ESRGAN `.pth` weights. See
-[`build/README.md`](./build/README.md) for the pipeline (Stage A on
-CPU exports ONNX; Stage B on the target GPU compiles a TRT engine).
-Run `make artifacts` for the full pipeline locally, or trigger the
-release workflow on tag push for the CI-built matrix.
+The `.onnx` files served via GitHub Releases are reproducible from
+upstream Real-ESRGAN `.pth` weights. See
+[`build/README.md`](./build/README.md) for the pipeline. Run
+`make artifacts` for the full pipeline locally, or trigger the
+release workflow on tag push for CI to build + publish.
 
 ## License
 
