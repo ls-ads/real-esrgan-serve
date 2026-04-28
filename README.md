@@ -143,9 +143,14 @@ release workflow on tag push for CI to build + publish.
 
 ## License
 
-Apache-2.0. See [`LICENSE`](./LICENSE).
+This project's own code is MIT — see [`LICENSE`](./LICENSE).
 
-The Real-ESRGAN model weights are distributed under their own
-[BSD-3-Clause](https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE)
-terms; check `models/MANIFEST.json` for the upstream link and license
-note for each artefact.
+It redistributes and depends on third-party software (Real-ESRGAN
+weights under BSD-3-Clause, NVIDIA CUDA runtime libraries under the
+NVIDIA EULA, onnxruntime / Pillow / Pydantic / et al under various
+permissive licenses). All attributions, obligations, and redistribution
+rules are catalogued in [`NOTICE.md`](./NOTICE.md), which also ships
+inside the runtime container at `/usr/share/doc/real-esrgan-serve/`.
+
+When forking or vendoring this repo, preserve `LICENSE`, `NOTICE.md`,
+and `third-party-licenses/`.

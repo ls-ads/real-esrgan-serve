@@ -5,17 +5,22 @@ cold-start + warm-latency smoke test.
 Repeatable + auditable for any maintainer with a RunPod account:
 
   1. Validate $RUNPOD_API_KEY (silent — never echoed).
-  2. Resolve the requested GPU class via gpuTypes query.
+  2. Resolve the requested GPU class to a RunPod GPU pool ID.
   3. Create or update the serverless endpoint with our image,
      workersMin=0 (so we can force cold starts on demand),
      workersMax configurable.
-  4. Wait for the endpoint to be in a runnable state.
-  5. Submit one cold-start job. Time it end-to-end.
-  6. Submit N warm jobs in series. Time each, compute p50/p95.
-  7. Print a summary that's machine-parseable on stdout (JSON line)
+  4. Submit one cold-start job. If it doesn't complete inside
+     --cold-start-timeout (default 300 s) the worker is treated as
+     stuck — script tears down the endpoint, redeploys, retries up
+     to --cold-start-retries times (default 2). Documented workaround
+     for RunPod's occasional 'worker pinned to a degraded host' bug.
+  5. Submit N warm jobs in series. Time each, compute p50/p95.
+  6. Print a summary that's machine-parseable on stdout (JSON line)
      and human-readable on stderr.
-  8. Optionally tear down the endpoint (--cleanup); default is to
-     leave it running so iosuite.io / other consumers can use it.
+  7. Tear down the endpoint. This is the default — pass
+     --keep-endpoint to skip teardown for interactive debugging.
+     Cleanup runs even on Ctrl-C or test failure (try/finally), so
+     a stuck script never silently leaves a billing worker behind.
 
 Usage:
     export RUNPOD_API_KEY=<your-key>
@@ -52,6 +57,11 @@ from pathlib import Path
 
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 RUNPOD_API_BASE = "https://api.runpod.ai/v2"
+
+
+class RunPodError(RuntimeError):
+    """Raised by RunPodClient.raw_query for cleanup paths that need
+    to downgrade API errors to warnings instead of hard-exiting."""
 
 # Serverless endpoints use GPU POOLS (grouped by VRAM + generation),
 # not specific GPU types. e.g. ADA_24 covers RTX 4090, RTX 4080
@@ -123,6 +133,16 @@ class RunPodClient:
         self._api_key = api_key
 
     def query(self, query: str, variables: dict | None = None) -> dict:
+        """Run a GraphQL query. Hard-exits the process on error; for
+        cleanup paths use raw_query() and handle errors yourself."""
+        try:
+            return self.raw_query(query, variables)
+        except RunPodError as e:
+            sys.exit(str(e))
+
+    def raw_query(self, query: str, variables: dict | None = None) -> dict:
+        """Like query() but raises RunPodError instead of sys.exit on
+        failure, so cleanup paths can downgrade errors to warnings."""
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
         req = urllib.request.Request(
             RUNPOD_GRAPHQL,
@@ -137,9 +157,9 @@ class RunPodClient:
             with urllib.request.urlopen(req, timeout=30) as r:
                 resp = json.loads(r.read())
         except urllib.error.HTTPError as e:
-            sys.exit(f"runpod http {e.code}: {e.read().decode(errors='replace')}")
+            raise RunPodError(f"runpod http {e.code}: {e.read().decode(errors='replace')}")
         if "errors" in resp:
-            sys.exit(f"runpod errors: {resp['errors']}")
+            raise RunPodError(f"runpod errors: {resp['errors']}")
         return resp["data"]
 
     def find_gpu_type_id(self, human_name: str) -> str:
@@ -259,33 +279,74 @@ class RunPodClient:
         data = self.query(mutation)
         return data["saveEndpoint"]["id"]
 
-    def delete_endpoint(self, endpoint_id: str) -> None:
+    def delete_endpoint(self, endpoint_id: str) -> bool:
+        """Best-effort tear-down: drain workers, delete, then poll
+        until the endpoint disappears from the listing or 30 s pass.
+        Returns True on confirmed deletion, False otherwise. Never
+        raises — callers in `finally` blocks need this contract."""
+        # Drain. Look up the endpoint's name first because RunPod's
+        # saveEndpoint mutation requires `name` in the input even for
+        # partial updates (it's a 400 GRAPHQL_VALIDATION_FAILED
+        # otherwise — undocumented quirk). If lookup fails we skip
+        # the drain entirely and rely on RunPod auto-draining
+        # workers as part of deleteEndpoint.
+        name = None
         try:
-            # Workers must be drained before delete; set both to 0.
-            self.query(f"""
-                mutation {{
-                    saveEndpoint(input: {{
-                        id: "{endpoint_id}",
-                        workersMin: 0,
-                        workersMax: 0
-                    }}) {{ id }}
-                }}
-            """)
+            data = self.raw_query("query { myself { endpoints { id name } } }")
+            for e in data["myself"]["endpoints"]:
+                if e["id"] == endpoint_id:
+                    name = e["name"]
+                    break
+        except RunPodError:
+            pass
+
+        if name:
+            try:
+                self.raw_query(
+                    f'mutation {{ saveEndpoint(input: {{'
+                    f' id: "{endpoint_id}", name: "{name}",'
+                    f' workersMin: 0, workersMax: 0'
+                    f' }}) {{ id }} }}'
+                )
+            except RunPodError as e:
+                print(f"[deploy] drain warning (continuing): {e}", file=sys.stderr)
+
+        time.sleep(3)
+
+        # Delete. RunPod returns null for the void result on success,
+        # so we don't trust the return — we poll the endpoint listing.
+        try:
+            self.raw_query(f'mutation {{ deleteEndpoint(id: "{endpoint_id}") }}')
+        except RunPodError as e:
+            print(f"[deploy] delete error (will still verify): {e}", file=sys.stderr)
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                data = self.raw_query("query { myself { endpoints { id } } }")
+                ids = {e["id"] for e in data["myself"]["endpoints"]}
+                if endpoint_id not in ids:
+                    print(f"[deploy] deleted endpoint {endpoint_id}", file=sys.stderr)
+                    return True
+            except RunPodError as e:
+                print(f"[deploy] delete-poll warning: {e}", file=sys.stderr)
             time.sleep(2)
-            self.query(f'mutation {{ deleteEndpoint(id: "{endpoint_id}") }}')
-            print(f"[deploy] deleted endpoint {endpoint_id}", file=sys.stderr)
-        except SystemExit:
-            print(f"[deploy] WARNING: failed to delete endpoint {endpoint_id} — "
-                  f"check RunPod console!", file=sys.stderr)
+
+        print(f"[deploy] WARNING: endpoint {endpoint_id} still listed after 30 s — "
+              f"check RunPod console.", file=sys.stderr)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Job submission via the v2 REST API
 # ─────────────────────────────────────────────────────────────────────
 
-def submit_job(endpoint_id: str, api_key: str, payload: dict, timeout_s: int = 600) -> dict:
+def submit_job(endpoint_id: str, api_key: str, payload: dict, timeout_s: int = 300) -> dict:
     """POST a job, poll status until COMPLETED or FAILED. Returns the
-    final status response (which includes timing fields)."""
+    final status response (which includes timing fields). Raises
+    TimeoutError if the job is still IN_QUEUE / IN_PROGRESS past
+    `timeout_s` — caller decides whether to give up or recreate the
+    endpoint and retry."""
     submit_url = f"{RUNPOD_API_BASE}/{endpoint_id}/run"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -315,6 +376,84 @@ def submit_job(endpoint_id: str, api_key: str, payload: dict, timeout_s: int = 6
             return status
         time.sleep(0.5)
     raise TimeoutError(f"job {job_id} did not complete within {timeout_s}s")
+
+
+def deploy_endpoint(rp: RunPodClient, args: argparse.Namespace,
+                    auth_id: str | None, gpu_pool: str) -> str:
+    """Idempotent deploy: ensure template + endpoint match args, return
+    endpoint_id. Same flow as a fresh deploy or a recreate-after-stuck
+    retry — the 'existing endpoint' branch handles the redeploy case."""
+    template_name = args.endpoint_name + "-tmpl"
+    existing_tmpl = rp.find_template(template_name)
+    if existing_tmpl:
+        print(f"[deploy] updating template: {existing_tmpl['id']} "
+              f"({existing_tmpl.get('imageName')} → {args.image})",
+              file=sys.stderr)
+    else:
+        print(f"[deploy] creating template: {template_name}", file=sys.stderr)
+    template_id = rp.save_template(
+        name=template_name,
+        image=args.image,
+        container_disk_gb=args.container_disk_gb,
+        existing_id=existing_tmpl["id"] if existing_tmpl else None,
+        registry_auth_id=auth_id,
+    )
+    print(f"[deploy] template id: {template_id}", file=sys.stderr)
+
+    existing = rp.find_endpoint(args.endpoint_name)
+    if existing:
+        print(f"[deploy] updating endpoint: {existing['id']}", file=sys.stderr)
+    else:
+        print(f"[deploy] creating endpoint: {args.endpoint_name}", file=sys.stderr)
+    endpoint_id = rp.save_endpoint(
+        name=args.endpoint_name,
+        template_id=template_id,
+        gpu_type_id=gpu_pool,
+        workers_min=0,
+        workers_max=args.workers_max,
+        idle_timeout_s=args.idle_timeout,
+        existing_id=existing["id"] if existing else None,
+    )
+    print(f"[deploy] endpoint id: {endpoint_id}", file=sys.stderr)
+    if existing:
+        # Updates need a beat for RunPod to register the new image.
+        time.sleep(5)
+    return endpoint_id
+
+
+def cold_start_with_retry(rp: RunPodClient, args: argparse.Namespace,
+                          auth_id: str | None, gpu_pool: str,
+                          endpoint_id: str, api_key: str,
+                          payload: dict) -> tuple[dict, str]:
+    """Run the cold-start job with bounded retries. On TimeoutError —
+    typically caused by a worker stuck in `initializing` because RunPod
+    placed it on a degraded host or the GPU pool is throttling — tear
+    down the endpoint and recreate to force a fresh worker spawn on
+    a different host. Returns (cold_status, endpoint_id) where
+    endpoint_id may have changed if a retry recreated the endpoint."""
+    last_exc: Exception | None = None
+    for attempt in range(args.cold_start_retries + 1):
+        attempt_label = f"attempt {attempt + 1}/{args.cold_start_retries + 1}"
+        print(f"\n[deploy] === COLD START === ({attempt_label}, "
+              f"timeout {args.cold_start_timeout}s)", file=sys.stderr)
+        try:
+            cold = submit_job(endpoint_id, api_key, payload,
+                              timeout_s=args.cold_start_timeout)
+            return cold, endpoint_id
+        except TimeoutError as e:
+            last_exc = e
+            print(f"[deploy] cold-start timeout: {e}", file=sys.stderr)
+            if attempt >= args.cold_start_retries:
+                break
+            print(f"[deploy] tearing down stuck endpoint {endpoint_id} "
+                  f"and redeploying for retry...", file=sys.stderr)
+            rp.delete_endpoint(endpoint_id)
+            endpoint_id = deploy_endpoint(rp, args, auth_id, gpu_pool)
+
+    raise RuntimeError(
+        f"cold start did not complete after {args.cold_start_retries + 1} "
+        f"attempts: {last_exc}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -348,8 +487,26 @@ def main() -> int:
                    help="container disk allocation")
     p.add_argument("--warmup-jobs", type=int, default=5,
                    help="number of warm-state jobs to time after the cold one")
+    p.add_argument("--cold-start-timeout", type=int, default=300,
+                   help="seconds to wait for the cold-start job before declaring "
+                        "the worker stuck. Real cold starts on RTX 4090 land at "
+                        "~50 s; 300 s is ~6x headroom. Anything past this is "
+                        "almost certainly a stuck `initializing` worker.")
+    p.add_argument("--cold-start-retries", type=int, default=2,
+                   help="if the cold-start job times out, tear down the endpoint "
+                        "and recreate to force a fresh worker spawn on a "
+                        "different RunPod host, then retry. This is the "
+                        "documented workaround for the occasional 'worker stuck "
+                        "in initializing' state we've hit. 0 disables retries.")
+    p.add_argument("--keep-endpoint", action="store_true",
+                   help="leave the endpoint running after the smoke test. "
+                        "Default is to delete it (and template) so a smoke "
+                        "test never silently bills you for an idle worker. "
+                        "Use this for interactive debugging.")
+    # Back-compat: --cleanup used to be opt-in; now cleanup is the
+    # default. Accept the flag silently so old invocations still work.
     p.add_argument("--cleanup", action="store_true",
-                   help="delete the endpoint after the smoke test (default: keep)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--registry-auth-id",
                    help="RunPod container registry auth id for private images "
                         "(create one at runpod.io/console/user/settings → "
@@ -382,45 +539,12 @@ def main() -> int:
                   "then pass --registry-auth-id <id>.",
                   file=sys.stderr)
 
-    # Step 1: template — image + disk + env. Endpoints reference these.
-    template_name = args.endpoint_name + "-tmpl"
-    existing_tmpl = rp.find_template(template_name)
-    if existing_tmpl:
-        print(f"[deploy] updating template: {existing_tmpl['id']} ({existing_tmpl.get('imageName')} → {args.image})",
-              file=sys.stderr)
-    else:
-        print(f"[deploy] creating template: {template_name}", file=sys.stderr)
-    template_id = rp.save_template(
-        name=template_name,
-        image=args.image,
-        container_disk_gb=args.container_disk_gb,
-        existing_id=existing_tmpl["id"] if existing_tmpl else None,
-        registry_auth_id=auth_id,
-    )
-    print(f"[deploy] template id: {template_id}", file=sys.stderr)
+    # Deploy template + endpoint. Wrapped in try/finally so a Ctrl-C
+    # or unhandled exception during the smoke test still cleans up
+    # the endpoint — leaving an idle GPU worker billing in the
+    # background is the worst failure mode of this script.
+    endpoint_id = deploy_endpoint(rp, args, auth_id, gpu_pool)
 
-    # Step 2: endpoint — points at the template + GPU/scaling.
-    existing = rp.find_endpoint(args.endpoint_name)
-    if existing:
-        print(f"[deploy] updating endpoint: {existing['id']}", file=sys.stderr)
-    else:
-        print(f"[deploy] creating endpoint: {args.endpoint_name}", file=sys.stderr)
-    endpoint_id = rp.save_endpoint(
-        name=args.endpoint_name,
-        template_id=template_id,
-        gpu_type_id=gpu_pool,
-        workers_min=0,
-        workers_max=args.workers_max,
-        idle_timeout_s=args.idle_timeout,
-        existing_id=existing["id"] if existing else None,
-    )
-    print(f"[deploy] endpoint id: {endpoint_id}", file=sys.stderr)
-
-    # If we just updated, give RunPod a beat to register the new image.
-    if existing:
-        time.sleep(5)
-
-    # ─── Smoke test ──────────────────────────────────────────────
     payload = {
         "input": {
             "image_base64": _TEST_PNG_64x64_B64,
@@ -428,82 +552,91 @@ def main() -> int:
         }
     }
 
-    print(f"\n[deploy] === COLD START === (workers idle, image cold)", file=sys.stderr)
-    cold = submit_job(endpoint_id, api_key, payload)
-    if cold["status"] != "COMPLETED":
-        print(f"[deploy] cold-start job failed: {json.dumps(cold, indent=2)}", file=sys.stderr)
-        return 2
+    summary: dict | None = None
+    try:
+        cold, endpoint_id = cold_start_with_retry(
+            rp, args, auth_id, gpu_pool, endpoint_id, api_key, payload,
+        )
+        if cold["status"] != "COMPLETED":
+            print(f"[deploy] cold-start job failed: {json.dumps(cold, indent=2)}",
+                  file=sys.stderr)
+            return 2
 
-    print(f"  walltime:   {fmt_ms(cold['_walltime_s'] * 1000)}", file=sys.stderr)
-    print(f"  delayTime:  {fmt_ms(cold.get('delayTime', 0))}    "
-          "(queue + worker spawn + image pull + container start)", file=sys.stderr)
-    print(f"  execTime:   {fmt_ms(cold.get('executionTime', 0))}    "
-          "(handler init + ORT load + first inference)", file=sys.stderr)
+        print(f"  walltime:   {fmt_ms(cold['_walltime_s'] * 1000)}", file=sys.stderr)
+        print(f"  delayTime:  {fmt_ms(cold.get('delayTime', 0))}    "
+              "(queue + worker spawn + image pull + container start)",
+              file=sys.stderr)
+        print(f"  execTime:   {fmt_ms(cold.get('executionTime', 0))}    "
+              "(handler init + ORT load + first inference)", file=sys.stderr)
 
-    print(f"\n[deploy] === WARM x{args.warmup_jobs} === (worker stays alive)", file=sys.stderr)
-    warm_walltimes_ms: list[float] = []
-    warm_exec_ms: list[float] = []
-    for i in range(args.warmup_jobs):
-        warm = submit_job(endpoint_id, api_key, payload)
-        if warm["status"] != "COMPLETED":
-            print(f"  warm[{i}] FAILED: {warm.get('error')}", file=sys.stderr)
-            continue
-        wt = warm["_walltime_s"] * 1000
-        et = warm.get("executionTime", 0)
-        warm_walltimes_ms.append(wt)
-        warm_exec_ms.append(et)
-        print(f"  warm[{i}]: walltime={fmt_ms(wt)}  exec={fmt_ms(et)}", file=sys.stderr)
+        print(f"\n[deploy] === WARM x{args.warmup_jobs} === (worker stays alive)",
+              file=sys.stderr)
+        warm_walltimes_ms: list[float] = []
+        warm_exec_ms: list[float] = []
+        for i in range(args.warmup_jobs):
+            warm = submit_job(endpoint_id, api_key, payload,
+                              timeout_s=args.cold_start_timeout)
+            if warm["status"] != "COMPLETED":
+                print(f"  warm[{i}] FAILED: {warm.get('error')}", file=sys.stderr)
+                continue
+            wt = warm["_walltime_s"] * 1000
+            et = warm.get("executionTime", 0)
+            warm_walltimes_ms.append(wt)
+            warm_exec_ms.append(et)
+            print(f"  warm[{i}]: walltime={fmt_ms(wt)}  exec={fmt_ms(et)}",
+                  file=sys.stderr)
 
-    # Summary — JSON to stdout for tooling, table to stderr for humans
-    summary = {
-        "endpoint_id": endpoint_id,
-        "endpoint_name": args.endpoint_name,
-        "image": args.image,
-        "gpu_class": args.gpu_class,
-        "cold_start": {
-            "walltime_ms": cold["_walltime_s"] * 1000,
-            "delay_ms": cold.get("delayTime", 0),
-            "exec_ms": cold.get("executionTime", 0),
-        },
-        "warm": {
-            "n": len(warm_walltimes_ms),
-            "walltime_ms": {
-                "mean": statistics.mean(warm_walltimes_ms) if warm_walltimes_ms else None,
-                "p50":  statistics.median(warm_walltimes_ms) if warm_walltimes_ms else None,
-                "p95":  (
-                    sorted(warm_walltimes_ms)[int(0.95 * len(warm_walltimes_ms))]
-                    if len(warm_walltimes_ms) >= 2 else None
-                ),
+        summary = {
+            "endpoint_id": endpoint_id,
+            "endpoint_name": args.endpoint_name,
+            "image": args.image,
+            "gpu_class": args.gpu_class,
+            "cold_start": {
+                "walltime_ms": cold["_walltime_s"] * 1000,
+                "delay_ms": cold.get("delayTime", 0),
+                "exec_ms": cold.get("executionTime", 0),
             },
-            "exec_ms": {
-                "mean": statistics.mean(warm_exec_ms) if warm_exec_ms else None,
-                "p50":  statistics.median(warm_exec_ms) if warm_exec_ms else None,
+            "warm": {
+                "n": len(warm_walltimes_ms),
+                "walltime_ms": {
+                    "mean": statistics.mean(warm_walltimes_ms) if warm_walltimes_ms else None,
+                    "p50":  statistics.median(warm_walltimes_ms) if warm_walltimes_ms else None,
+                    "p95":  (
+                        sorted(warm_walltimes_ms)[int(0.95 * len(warm_walltimes_ms))]
+                        if len(warm_walltimes_ms) >= 2 else None
+                    ),
+                },
+                "exec_ms": {
+                    "mean": statistics.mean(warm_exec_ms) if warm_exec_ms else None,
+                    "p50":  statistics.median(warm_exec_ms) if warm_exec_ms else None,
+                },
             },
-        },
-    }
-    print(json.dumps(summary, indent=2))  # stdout: machine-readable
+        }
+        print(json.dumps(summary, indent=2))  # stdout: machine-readable
 
-    print("\n[deploy] === SUMMARY ===", file=sys.stderr)
-    print(f"  cold start (full e2e):      {fmt_ms(summary['cold_start']['walltime_ms'])}",
-          file=sys.stderr)
-    print(f"    of which queue + spawn:   {fmt_ms(summary['cold_start']['delay_ms'])}",
-          file=sys.stderr)
-    print(f"    of which exec on worker:  {fmt_ms(summary['cold_start']['exec_ms'])}",
-          file=sys.stderr)
-    if warm_exec_ms:
-        print(f"  warm walltime mean / p50:    {fmt_ms(summary['warm']['walltime_ms']['mean'])} / "
-              f"{fmt_ms(summary['warm']['walltime_ms']['p50'])}",
+        print("\n[deploy] === SUMMARY ===", file=sys.stderr)
+        print(f"  cold start (full e2e):      {fmt_ms(summary['cold_start']['walltime_ms'])}",
               file=sys.stderr)
-        print(f"  warm exec mean / p50:        {fmt_ms(summary['warm']['exec_ms']['mean'])} / "
-              f"{fmt_ms(summary['warm']['exec_ms']['p50'])}",
+        print(f"    of which queue + spawn:   {fmt_ms(summary['cold_start']['delay_ms'])}",
               file=sys.stderr)
+        print(f"    of which exec on worker:  {fmt_ms(summary['cold_start']['exec_ms'])}",
+              file=sys.stderr)
+        if warm_exec_ms:
+            print(f"  warm walltime mean / p50:    {fmt_ms(summary['warm']['walltime_ms']['mean'])} / "
+                  f"{fmt_ms(summary['warm']['walltime_ms']['p50'])}",
+                  file=sys.stderr)
+            print(f"  warm exec mean / p50:        {fmt_ms(summary['warm']['exec_ms']['mean'])} / "
+                  f"{fmt_ms(summary['warm']['exec_ms']['p50'])}",
+                  file=sys.stderr)
 
-    if args.cleanup:
-        rp.delete_endpoint(endpoint_id)
-    else:
-        print(f"\n[deploy] endpoint left running ({endpoint_id}). "
-              f"Use --cleanup to tear down, or RunPod console.",
-              file=sys.stderr)
+    finally:
+        if args.keep_endpoint:
+            print(f"\n[deploy] --keep-endpoint set; leaving {endpoint_id} running. "
+                  f"Tear down via RunPod console when done.", file=sys.stderr)
+        else:
+            print(f"\n[deploy] tearing down endpoint {endpoint_id}...",
+                  file=sys.stderr)
+            rp.delete_endpoint(endpoint_id)
 
     return 0
 

@@ -96,6 +96,14 @@ COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
 COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
 RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
 
+# Ship licensing notices alongside the binary so redistribution
+# (Docker pull → run) inherently carries the attributions BSD-3-Clause
+# and Apache 2.0 require. Standard FHS path; surface them via
+# `docker run --rm <image> cat /usr/share/doc/real-esrgan-serve/NOTICE.md`.
+COPY LICENSE                       /usr/share/doc/real-esrgan-serve/LICENSE
+COPY NOTICE.md                     /usr/share/doc/real-esrgan-serve/NOTICE.md
+COPY third-party-licenses/         /usr/share/doc/real-esrgan-serve/third-party-licenses/
+
 # Cache dirs. /var/cache/real-esrgan-serve/ holds fetched .onnx
 # weights. Mount a persistent volume here in providers (RunPod
 # Network Volume, K8s PVC, etc.) so an out-of-image fetch survives
