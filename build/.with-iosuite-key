@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# build/.with-iosuite-key — maintainer-only convenience wrapper.
+#
+# Pulls RUNPOD_API_KEY from ~/Projects/iosuite.io/.env (silently — the
+# value never echoes to stdout/stderr or gets logged) and execs the
+# command that follows with the key in env. Other developers should
+# set RUNPOD_API_KEY directly via their own mechanism; this wrapper
+# only exists so the maintainer doesn't have to copy/paste keys into
+# shells.
+#
+# The leading dot in the filename is intentional — typo-protection +
+# discourages anyone from importing this into their own workflow,
+# since the iosuite.io path is a personal-machine assumption.
+#
+# Usage:
+#   build/.with-iosuite-key python build/remote_build.py --onnx ... --gpu-class rtx-4090
+#   build/.with-iosuite-key make remote-build-engine GPU_CLASS=rtx-4090
+#
+# Behaviour:
+#   - If $RUNPOD_API_KEY is already set in env, leaves it alone.
+#   - Else, reads only the RUNPOD_API_KEY line from the .env using awk
+#     (does NOT source the whole file — avoids accidentally pulling
+#     unrelated app secrets into our process env).
+#   - Errors loudly if the .env doesn't exist or doesn't have the key,
+#     pointing the user at the standard `export` path.
+#   - `exec` replaces this shell with the target command — no
+#     intermediate process, no extra env leak surface.
+
+set -euo pipefail
+
+if [[ -z "${RUNPOD_API_KEY:-}" ]]; then
+    iosuite_env="${IOSUITE_ENV:-${HOME}/Projects/iosuite.io/.env}"
+    if [[ ! -f "$iosuite_env" ]]; then
+        cat >&2 <<EOF
+.with-iosuite-key: $iosuite_env not found.
+
+Either:
+  - export RUNPOD_API_KEY=... directly before running, or
+  - point IOSUITE_ENV at a different .env file:
+      IOSUITE_ENV=/path/to/.env build/.with-iosuite-key <cmd>
+EOF
+        exit 1
+    fi
+
+    # Pull only the one line we need. -F= splits on '=', NF>1 ensures
+    # there's a value, sub strips an optional surrounding pair of
+    # quotes. The result is captured into a local var; never printed.
+    key="$(awk -F= '$1=="RUNPOD_API_KEY" && NF>1 {
+        v=substr($0, index($0,"=")+1);
+        gsub(/^["'\'']|["'\'']$/, "", v);
+        print v; exit
+    }' "$iosuite_env")"
+
+    if [[ -z "$key" ]]; then
+        echo ".with-iosuite-key: RUNPOD_API_KEY not present in $iosuite_env" >&2
+        exit 1
+    fi
+
+    export RUNPOD_API_KEY="$key"
+    unset key
+fi
+
+exec "$@"

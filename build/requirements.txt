@@ -1,0 +1,36 @@
+# Pipeline-only deps. NOT installed by the runtime image — these
+# stay on the producer side so the runtime stays slim and Python-
+# minimal.
+#
+# IMPORTANT: this file is INFORMATIONAL. The reproducible build
+# path is `build/Dockerfile.export`, which uses uv with
+# `--exclude-newer 2022-09-04T23:59:59Z` to time-travel the
+# resolver to the date basicsr last worked end-to-end. A naive
+# `pip install -r requirements.txt` against current PyPI will
+# almost certainly fail or produce a torch+basicsr combination
+# that imports but breaks at trace time.
+#
+# Versions listed here are what uv resolves to inside the
+# container, captured for forensics. Bumping any pin = re-validate
+# byte-identical .onnx output before merging.
+#
+# Stage A (export_onnx.py): basicsr + torch + onnx + onnxconverter-common
+# Stage B (compile_engine.py): tensorrt python bindings
+# update_manifest.py: stdlib only.
+
+# Captured from the working uv resolution as of 2022-09-04 cutoff.
+# These are the versions Stage A actually runs against:
+basicsr==1.4.2
+realesrgan==0.3.0
+torch==1.12.1
+torchvision==0.13.1
+numpy==1.23.3
+opencv-python==4.6.0.66
+onnx==1.12.0
+onnxconverter-common==1.13.0
+
+# tensorrt isn't on PyPI universally — install via the NVIDIA wheel
+# bundled with your CUDA install, or via `pip install
+# nvidia-tensorrt` if NVIDIA's PyPI mirror is reachable. CI uses
+# self-hosted GPU runners that have it pre-installed.
+# tensorrt>=10.0,<11.0

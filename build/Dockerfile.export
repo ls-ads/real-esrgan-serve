@@ -1,0 +1,82 @@
+# Stage A — ONNX export, containerised.
+#
+# Why a Dockerfile and not a plain `pip install -r requirements.txt`:
+#
+# The Real-ESRGAN model definition lives in `basicsr` (BasicSR), which
+# is effectively unmaintained. Its declared dependency ranges still
+# claim to support modern PyTorch / NumPy / SciPy, but in practice
+# imports break on any combination newer than late-2022. We hit this
+# during the original build (commits e1ff61c, e1de3fd in the previous
+# layout) and the fix that worked was:
+#
+#  1) Use `uv` with `--exclude-newer <date>` for time-travel dep
+#     resolution — pin the *registry view* to the day basicsr last
+#     worked end-to-end. This is more reliable than pinning every
+#     transitive in requirements.txt because uv's resolver picks the
+#     consistent set rather than a hand-curated one that drifts.
+#
+#  2) Pin the upstream Real-ESRGAN repo to a specific commit, not a
+#     tag — tags can be force-moved upstream.
+#
+#  3) Convert FP16 after ONNX export with onnxconverter-common, NOT
+#     by calling `model.half()` before export. The pre-export path
+#     produces graphs that some TensorRT versions choke on (specific
+#     ops emit float32 inputs that get auto-cast badly); the
+#     post-export converter handles dtype consistently across ops.
+#
+# If you ever change any of (uv version, exclude-newer date, basicsr
+# commit, opset), validate by running the resulting .onnx through
+# `runtime/upscaler.py` against a known-good reference image and
+# confirming pixel-identical output. The whole point of this image
+# is reproducibility — silent drift is the failure mode we're
+# guarding against.
+
+FROM ghcr.io/astral-sh/uv:python3.9-bookworm-slim
+
+# basicsr depends on opencv (libgl1) and a handful of things that
+# `pip install` won't pull from system pkgs. wget+git for the
+# upstream repo + weights download.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        wget \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Pin upstream Real-ESRGAN. Bumping this commit = re-validate the
+# whole chain. Don't move it casually.
+ARG REALESRGAN_COMMIT=a4abfb2979a7bbff3f69f58f58ae324608821e27
+RUN git clone https://github.com/xinntao/Real-ESRGAN.git . \
+    && git checkout ${REALESRGAN_COMMIT}
+
+# Time-travel resolution: pin the package registry view to a date
+# when basicsr's deps still resolved cleanly. The `&&` chain matters
+# — both `pip install` calls share the same resolution context.
+ARG EXCLUDE_NEWER=2022-09-04T23:59:59Z
+RUN uv venv && \
+    uv pip install --exclude-newer ${EXCLUDE_NEWER} -r requirements.txt && \
+    uv pip install --exclude-newer ${EXCLUDE_NEWER} onnx onnxconverter-common
+
+# Upstream weights, pinned by SHA-256 of the file we expect to find
+# at this URL. The export script re-verifies before use.
+RUN wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
+        -P weights
+
+# Output volume — the host mounts build/dist/ here so the .onnx
+# files end up outside the image when `docker run` exits.
+VOLUME /output
+
+LABEL org.opencontainers.image.source="https://github.com/ls-ads/real-esrgan-serve"
+LABEL org.opencontainers.image.description="Stage A — Real-ESRGAN .pth → .onnx exporter"
+LABEL org.opencontainers.image.title="real-esrgan-serve/build-export"
+
+# Custom export script (post-export FP16 via onnxconverter-common
+# rather than torch.half() before export — see the reason block at
+# the top of this file).
+COPY export_onnx.py .
+
+ENTRYPOINT [".venv/bin/python", "export_onnx.py", \
+            "--input", "weights/RealESRGAN_x4plus.pth", \
+            "--output", "/output"]

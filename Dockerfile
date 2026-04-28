@@ -1,49 +1,108 @@
-# --- Stage 1: Build the Go application ---
-FROM nvcr.io/nvidia/tensorrt:25.01-py3 AS builder
+# real-esrgan-serve runtime image — license-clean + cold-start-optimised.
+#
+# COLD-START IS THE PRIMARY OPTIMISATION TARGET HERE.
+# RunPod (and other serverless GPU providers) pull the full image to
+# every node on every cold start. A 4 GB image over a typical
+# multi-GB/s registry pull is still ~10–30 s of pure waiting before
+# the model has even been touched. The previous shape sat around
+# ~4 GB; this one targets <1 GB.
+#
+# Layer ordering matters: slow-changing layers (apt, pip) come first
+# so RunPod's image puller resumes partial pulls cleanly when only
+# the final layers (Go binary, Python script) change between
+# releases. NEVER reshuffle this without re-checking the published
+# image-layer sizes.
+#
+# Sizing breakdown (approximate, ubuntu22.04 + cuda 12.4):
+#   nvidia/cuda:base            ~150 MB   (libcuda.so.1 + nvidia-smi)
+#   python3 + pip + apt-cleaned ~100 MB
+#   numpy + pillow (apt)        ~ 50 MB
+#   onnxruntime-gpu wheel       ~500 MB   (bundles cuDNN, cuBLAS, etc.)
+#   Go binary (CGO=0, stripped) ~ 10 MB
+#   runtime/upscaler.py         < 1 MB
+#   ───────────────────────────────────
+#                       Total   ~810 MB
+#
+# Why nvidia/cuda:base and NOT :runtime: the :runtime variant ships
+# the full CUDA runtime (~3.5 GB worth of libs the wheel doesn't
+# need). onnxruntime-gpu's pip wheel bundles its own copies of
+# cuDNN + cuBLAS; we only need libcuda.so.1 from the host (provided
+# by nvidia-container-toolkit at runtime) plus a working python.
+# Validated against onnxruntime-gpu 1.18.x; if a future ORT release
+# starts demanding system CUDA libs, fall back to :runtime here.
+#
+# Why pre-baked model on top of an `runtime` layer: Stage A's .onnx
+# (~67 MB FP16 / ~134 MB FP32) is pre-fetched in the provider-
+# specific Dockerfile (e.g. providers/runpod/Dockerfile), NOT here,
+# so the base image stays useful for non-RunPod consumers who fetch
+# their own weights. Provider images add the model on top, which is
+# the right caching shape.
+#
+# Build:
+#   make docker
+#   # equivalently: docker build -t real-esrgan-serve:dev .
+# Run (one-shot upscale):
+#   docker run --rm --gpus all \
+#     -v $PWD/imgs:/work \
+#     real-esrgan-serve:dev upscale -i /work/in.jpg -o /work/out.jpg \
+#     --model realesrgan-x4plus
+# ─────────────────────────────────────────────────────────────────────
 
-# Install Go and Make
-RUN apt-get update && apt-get install -y wget make && \
-    wget https://go.dev/dl/go1.21.0.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz && \
-    rm go1.21.0.linux-amd64.tar.gz
-
-ENV PATH=$PATH:/usr/local/go/bin
-ENV CGO_ENABLED=1
-
-# Set up workspace
-WORKDIR /app
-
-# Pre-copy/cache go.mod so we don't redownload dependencies every build
+# --- Stage 1: build the Go binary ───────────────────────────────────
+FROM golang:1.25-alpine AS gobuild
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+COPY cmd/      ./cmd/
+COPY internal/ ./internal/
+COPY models/   ./models/
+ARG VERSION=dev
+# CGO=0 + -s -w + trimpath = smallest, fully static, reproducible binary.
+RUN CGO_ENABLED=0 go build \
+        -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/real-esrgan-serve \
+        ./cmd/real-esrgan-serve
 
-# Copy application source code
-COPY . .
+# --- Stage 2: runtime (slim) ────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
 
-# Build the standalone binary using the Makefile
-RUN make build
+# Minimal Python + image I/O. apt --no-install-recommends drops
+# ~80 MB of optional Suggests/Recommends. Cleaning apt caches and
+# tmp in the SAME RUN is what keeps the layer thin (a separate `rm`
+# layer would still carry the cache bytes).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-numpy \
+        python3-pil \
+        ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
 
-# --- Stage 2: Create a minimal runtime environment ---
-# We still need the TensorRT and CUDA shared libraries (.so files) at runtime,
-# so we use a runtime TensorRT image rather than a completely empty scratch container
-FROM nvcr.io/nvidia/tensorrt:25.01-py3
+# onnxruntime-gpu pinned to a CUDA-12-compatible release. The wheel
+# bundles cuDNN + the TensorRT EP; first-use compilation produces a
+# cached engine under XDG_CACHE_HOME (mount a volume there in
+# production to survive container churn).
+#
+# `--no-deps --no-cache-dir` is deliberate: numpy is already
+# installed via apt, and pip's cache adds ~200 MB to the layer if
+# left enabled.
+RUN pip3 install --no-cache-dir --no-deps onnxruntime-gpu==1.18.1 \
+    && rm -rf /root/.cache /tmp/*
 
-# Set up working directory for the application
-WORKDIR /app
+# Late-arriving artefacts (small, change every build) ────────────────
+COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
+COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
+RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
 
-# Copy only the compiled Go binary from the builder stage
-COPY --from=builder /app/real-esrgan-serve /app/real-esrgan-serve
+# Cache dirs. /var/cache/real-esrgan-serve/ holds fetched .onnx +
+# TRT engine cache. Mount a persistent volume here in providers
+# (RunPod Network Volume, K8s PVC, etc.) so engine compilation is
+# paid once per GPU class and survives container restarts.
+ENV XDG_CACHE_HOME=/var/cache \
+    REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py
 
-# Create an io directory for users to mount their input/output files into
-RUN mkdir -p /workspace
-
-# Expose the HTTP server port
-EXPOSE 8080
-
-# Add labels for container description
-LABEL org.opencontainers.image.source="https://github.com/ls-ads/real-esrgan-serve"
-LABEL org.opencontainers.image.description="A standalone Go CLI tool that bridges to a TensorRT (C/C++) implementation of Real-ESRGAN. Optimized specifically for the `realesrgan-x4plus` model."
-LABEL org.opencontainers.image.title="real-esrgan-serve/cli"
-
-# The default behavior logic can be controlled via Docker CMD/ENTRYPOINT overrides
-ENTRYPOINT ["/app/real-esrgan-serve"]
+ENTRYPOINT ["real-esrgan-serve"]
+CMD ["--help"]

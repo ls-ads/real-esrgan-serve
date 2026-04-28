@@ -1,0 +1,6 @@
+# Pipeline byproducts — large, belong in GH Releases not git.
+dist/*.onnx
+dist/*.engine
+.cache/
+.venv/
+__pycache__/

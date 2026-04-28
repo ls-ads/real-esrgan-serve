@@ -1,0 +1,6 @@
+# RunPod handler dependencies. Pin every version so a transitive
+# update doesn't surprise an in-flight deployment. Bump deliberately,
+# rebuild + smoke-test the template, then update the pin.
+runpod==1.7.4
+pydantic==2.9.2
+requests==2.32.3
