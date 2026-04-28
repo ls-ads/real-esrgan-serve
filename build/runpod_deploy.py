@@ -568,6 +568,16 @@ def main() -> int:
               file=sys.stderr)
         print(f"  execTime:   {fmt_ms(cold.get('executionTime', 0))}    "
               "(handler init + ORT load + first inference)", file=sys.stderr)
+        # Surface handler diagnostics (active EPs etc.) — RunPod's
+        # worker logs aren't reachable via API so the handler embeds
+        # this in its response payload.
+        diag = (cold.get("output") or {}).get("_diagnostics")
+        if diag:
+            print(f"  active EPs: {diag.get('providers')}", file=sys.stderr)
+            if "CUDAExecutionProvider" not in (diag.get("providers") or []):
+                print("  WARNING: CUDA EP did NOT load — workload ran on "
+                      "CPU. Likely libcudnn/libcublas/libcudart missing on "
+                      "the worker.", file=sys.stderr)
 
         print(f"\n[deploy] === WARM x{args.warmup_jobs} === (worker stays alive)",
               file=sys.stderr)

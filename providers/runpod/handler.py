@@ -141,7 +141,12 @@ class WarmHelper:
         ready = self._await_id("__ready__", timeout=120.0)
         if not ready or ready.get("event") != "ready":
             raise RuntimeError(f"helper did not signal ready: {ready}")
-        log.info("Helper ready")
+        # Stash diagnostics from the ready event so handler can include
+        # them in job responses. RunPod's worker logs aren't reachable
+        # via API; piggy-backing on the response payload is the only
+        # way to surface this information programmatically.
+        self.providers: list[str] = list(ready.get("providers") or [])
+        log.info(f"Helper ready (active EPs: {self.providers})")
 
     def _read_loop(self) -> None:
         for line in self._proc.stdout:  # type: ignore[union-attr]
@@ -263,6 +268,12 @@ def handler(job):
         except OSError:
             pass
 
+        # Diagnostics piggy-backed on every response. RunPod doesn't
+        # expose worker logs via API; this is the only programmatic
+        # channel back to the caller. Cheap (a few bytes) and lets the
+        # smoke-test verify GPU vs CPU EP without console scraping.
+        diagnostics = {"providers": _HELPER.providers}
+
         # Optional: also write to a caller-specified output_path inside
         # the container (useful when network volume is mounted)
         if payload.output_path:
@@ -276,6 +287,7 @@ def handler(job):
                 "model": "realesrgan-x4plus",
                 "input_resolution": f"{in_w}x{in_h}",
                 "output_format": payload.output_format,
+                "_diagnostics": diagnostics,
             }
 
         return {
@@ -284,6 +296,7 @@ def handler(job):
             "input_resolution": f"{in_w}x{in_h}",
             "output_resolution": f"{in_w * 4}x{in_h * 4}",
             "output_format": payload.output_format,
+            "_diagnostics": diagnostics,
         }
 
     except Exception as e:  # noqa: BLE001

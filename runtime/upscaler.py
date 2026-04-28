@@ -93,11 +93,30 @@ def _load_session(model_path: Path, gpu_id: int, json_events: bool):
     # Reduce log noise; the Go side wants clean stdout for JSON events
     session_options.log_severity_level = 3
 
-    return ort.InferenceSession(
+    sess = ort.InferenceSession(
         str(model_path),
         sess_options=session_options,
         providers=providers,
     )
+
+    # Diagnostic: ORT silently drops EPs that fail to initialize at
+    # session creation (e.g. CUDA EP can't load libcudnn / libcublas).
+    # `requested` is what we asked for; `actual` is what ORT ended up
+    # binding the session to. If actual==[CPUExecutionProvider] but we
+    # passed gpu_id>=0, ORT fell back silently and the workload is
+    # running on CPU even though the host has a GPU. Log loudly so the
+    # operator sees this in worker logs.
+    requested = [p[0] if isinstance(p, tuple) else p for p in providers]
+    actual = sess.get_providers()
+    print(f"[ort] requested EPs: {requested}", file=sys.stderr, flush=True)
+    print(f"[ort] active EPs:    {actual}", file=sys.stderr, flush=True)
+    if gpu_id >= 0 and "CUDAExecutionProvider" not in actual:
+        print(f"[ort] WARNING: CUDA EP requested but not active — "
+              f"running on CPU. Likely cause: libcudnn/libcublas/"
+              f"libcudart not on the linker path.",
+              file=sys.stderr, flush=True)
+
+    return sess
 
 
 def _preprocess(image_path: Path):
@@ -182,7 +201,11 @@ def run_serve(args: argparse.Namespace) -> int:
     until EOF. Errors on a single job emit an event but do not exit."""
     model = Path(args.model)
     session = _load_session(model, args.gpu_id, json_events=True)
-    _emit(True, event="ready")
+    # Include active EPs in the ready event so the handler can surface
+    # them in job responses — RunPod's worker logs aren't reachable via
+    # API, so we route the diagnostic through the response payload
+    # instead of relying on stderr scraping.
+    _emit(True, event="ready", providers=session.get_providers())
 
     for line in sys.stdin:
         line = line.strip()
