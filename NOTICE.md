@@ -82,14 +82,23 @@ container.
 | pydantic | 2.9.2 (RunPod provider only) | MIT |
 | requests | 2.32.3 (RunPod provider only) | Apache 2.0 |
 
-**`onnxruntime-gpu` carries an additional notice:** the Microsoft-
-published wheel bundles GPU support libraries (CUDA runtime, cuBLAS,
-cuFFT, etc.) that originate with NVIDIA and are governed by the
-NVIDIA Software License Agreement / CUDA Toolkit EULA. Microsoft has
-arranged the wheel-level redistribution; downstream redistribution
-(e.g. in a Docker image) is permitted under those terms.
-See [https://onnxruntime.ai/docs/install/](https://onnxruntime.ai/docs/install/)
-and the wheel's `LICENSE-nvidia` for the operative text.
+**`onnxruntime-gpu` 1.18.1 wheel — what we actually redistribute:**
+the wheel ships ORT's own MIT-licensed shared objects (the CUDA EP
+plugin `libonnxruntime_providers_cuda.so`, the TensorRT EP plugin,
+the pybind state module). It does **not** bundle copies of cuDNN,
+cuBLAS, cuFFT, cuRAND, or libcudart inside the wheel — those are
+expected to be resolvable on the system at runtime via the dynamic
+linker. We verified this: `find / -name "libcudnn*"` and `find / -name
+"libcublas*"` against the runtime image both return zero hits.
+At runtime the CUDA EP plugin's `dlopen` is satisfied by libraries
+bind-mounted into the container by the host's NVIDIA Container
+Toolkit (libcuda) plus libcudart, which ships with the
+`nvidia/cuda:12.4.1-base` base image (see Section 5). cuDNN /
+cuBLAS / cuFFT / cuRAND are **not** in the image and therefore
+**not redistributed by this project** — if a deployment uses ops
+that need them, they must come from the host. ORT 1.20+ wheels do
+bundle some of these libraries; if we ever bump, this section
+needs to be revisited.
 
 `runpod` (the Python SDK) drags in a long transitive dependency tree
 (fastapi, boto3, paramiko, sentry-sdk, etc.). pip's metadata reports
@@ -130,6 +139,16 @@ source disclosure.
 - Requires the EULA text to remain accessible (it ships in
   `/NGC-DL-CONTAINER-LICENSE` in the base image; we leave it in
   place).
+
+**Scope of NVIDIA libraries we actually redistribute:** only what's
+in `nvidia/cuda:12.4.1-base-ubuntu22.04` — namely `libcudart.so.12`
+(the CUDA runtime) and the `cuda-compat-12-4` driver-compatibility
+shims under `/usr/local/cuda-12.4/compat/`. We do **not** ship
+cuDNN, cuBLAS, cuFFT, cuRAND, TensorRT, NCCL, or any other CUDA-X
+library — installing those would require the `nvidia/cuda:cudnn-*`
+or `:runtime` variant or an explicit apt install, which we
+deliberately avoid for cold-start image-pull reasons (see the
+`Dockerfile` header).
 
 Full EULA: https://docs.nvidia.com/cuda/eula/index.html
 
