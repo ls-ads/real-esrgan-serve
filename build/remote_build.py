@@ -62,20 +62,21 @@ RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 # Default base image. Has Python + CUDA toolkit pre-installed.
 # tensorrt + make get pip/apt-installed by the startup script
 # (license-tangled image, used as a build sandbox only — never
-# redistributed). Pinned to CUDA 12.4.1 to match the runtime image
-# (Dockerfile.trt) — engines are ABI-tied to the CUDA + TRT version
-# they're built against, so building on 12.4 and running on 12.4
-# avoids any cross-version surprises.
+# redistributed). The runpod/pytorch image family doesn't have a
+# CUDA 12.8 variant yet, so we stick with 12.4.1-devel and let the
+# pip-installed tensorrt-cu12 wheel bring its own CUDA 12.8 runtime
+# libs. The host driver must support CUDA 12.8 (driver 560+) —
+# enforced via minCudaVersion below.
 DEFAULT_BUILD_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 
-# Filter pod placement to hosts with a CUDA driver new enough for our
-# CUDA 12.4 runtime (driver 550+). Without this, RunPod's scheduler
-# may place us on a host with an older driver, and TRT/CUDA fail at
-# init with cudaErrorInsufficientDriver (error 35) — our build then
-# burns ~5 min on pod spin-up only to crash on `trt.Builder(logger)`.
-# This is the field RunPod's UI exposes as "Minimum CUDA Version" on
-# the pod-create form.
-MIN_CUDA_VERSION = "12.4"
+# Filter pod placement to hosts with a CUDA driver new enough for the
+# pinned CUDA toolkit (driver 560+ for 12.8). Without this, RunPod's
+# scheduler may place us on a host with an older driver, and TRT/CUDA
+# fail at init with cudaErrorInsufficientDriver (error 35) — our
+# build then burns ~5 min on pod spin-up only to crash on
+# `trt.Builder(logger)`. This is the field RunPod's UI exposes as
+# "Minimum CUDA Version" on the pod-create form.
+MIN_CUDA_VERSION = "12.8"
 
 # Map kebab-case GPU class names → RunPod's GraphQL displayName for
 # the GPU type. RunPod's naming has been inconsistent over time
@@ -471,15 +472,19 @@ def main() -> int:
     #
     # TRT VERSION PIN — must match Dockerfile.trt's libnvinfer10. TRT
     # engines are tied to (TRT major.minor, CUDA major.minor); a
-    # mismatched runtime SIGSEGVs at deserialize. The latest TRT pip
-    # release built against CUDA 12.4 is 10.1.x; newer pip releases
-    # link CUDA 12.5+ which won't load on our 12.4 runtime base.
+    # mismatched runtime SIGSEGVs at deserialize.
     #
     # Pin `tensorrt-cu12` directly — the `tensorrt` metapackage has a
     # loose pin on its CUDA-specific binding subpackage, so installing
-    # `tensorrt==10.1.0` lets `tensorrt-cu12` resolve to the latest
-    # (10.16.x) and silently produces an engine for the wrong runtime.
-    # We learned this the hard way; see the trt-version-pinning memory.
+    # `tensorrt==X.Y.Z` lets `tensorrt-cu12` resolve to whatever's
+    # latest and silently produces an engine for the wrong runtime.
+    # See the feedback_trt_version_pinning memory.
+    #
+    # Pinned to 10.8.0.43 to match the runtime
+    # libnvinfer10=10.8.0.43-1+cuda12.8. 10.8 is the first release
+    # that actually compiles sm120 (Blackwell) — 10.7 advertises
+    # support but the builder rejects with "Target GPU SM 120 is not
+    # supported by this TensorRT release". 10.8+ requires CUDA 12.8+.
     startup = (
         "bash -c '"
         "mkdir -p /root/.ssh && chmod 700 /root/.ssh; "
@@ -490,7 +495,7 @@ def main() -> int:
         "    openssh-server make >/dev/null 2>&1; "
         "mkdir -p /run/sshd; "
         "service ssh start; "
-        "pip install --quiet --no-cache-dir tensorrt-cu12==10.1.0 && touch /tmp/setup-done; "
+        "pip install --quiet --no-cache-dir tensorrt-cu12==10.8.0.43 && touch /tmp/setup-done; "
         "sleep infinity"
         "'"
     )

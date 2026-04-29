@@ -50,7 +50,7 @@ GPU_CLASS_TO_SM = {
     "rtx-4090": "sm89", "l4": "sm89",
     "a6000": "sm86", "a40": "sm86", "a5000": "sm86", "a4000": "sm86",
     "a4500": "sm86", "rtx-3090": "sm86", "rtx-2000": "sm86",
-    "rtx-5090": "sm120",
+    "rtx-5090": "sm120", "rtx-5080": "sm120",
 }
 
 DEFAULT_DB_PATH = Path("build/bench/results.db")

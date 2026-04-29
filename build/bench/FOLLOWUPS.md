@@ -244,6 +244,25 @@ rather than to keep iterating tests.
 
 ## 4. Blackwell (sm120) support
 
+**Status: SHIPPED.** Runtime image bumped to CUDA 12.8 + TRT 10.8;
+sm120 engines (single + batched) published for rtx-5090 alongside
+the existing sm86 and sm89 engines. All pre-existing engines were
+recompiled against the new TRT version (engines are ABI-tied to
+TRT major.minor — bumping TRT invalidates old artefacts).
+
+**First Blackwell measurement on rtx-5090 trt at 720×720:**
+
+  - batch=1 (primary engine): 1058 ms (slower than rtx-4090's 615 ms
+    — single-mode engine on Blackwell isn't as well-tuned as on Ada;
+    worth investigating)
+  - batch=4 (batched engine): **336 ms/image** — fastest in the
+    project, ~2× rtx-4090's 607 ms/image.
+
+Cost at flex $0.00044/s = **$0.000148/img** at batch=4, basically
+tied with rtx-3090's $0.000143 despite being 2× faster wall-clock.
+Pick rtx-5090 when latency matters; pick rtx-3090 when only $/img
+matters.
+
 **Why it matters.** RTX 5090 / 5080 are excluded from the current
 build. Today that's mostly fine — the 4090 covers consumer workloads
 at lower cost — but if a customer hits cost/perf needs that only

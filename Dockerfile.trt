@@ -47,7 +47,13 @@ RUN CGO_ENABLED=0 go build \
         ./cmd/real-esrgan-serve
 
 # --- Stage 2: runtime ───────────────────────────────────────────────
-FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+# CUDA 12.8. Bumped to enable Blackwell (sm120 — RTX 5090 / 5080 / B200).
+# TRT 10.7 had partial sm120 support but rejected `Target GPU SM 120
+# is not supported by this TensorRT release` on engine compile; TRT
+# 10.8 is the first release that actually compiles sm120. TRT 10.8 is
+# only published against CUDA 12.8+. Driver requirement on the host:
+# 560+ for CUDA 12.8.
+FROM nvidia/cuda:12.8.0-base-ubuntu22.04
 
 # cuDNN 9 + the TensorRT runtime libraries.
 #
@@ -57,19 +63,20 @@ FROM nvidia/cuda:12.4.1-base-ubuntu22.04
 # SIGSEGV (no clean error from TRT, just the worker dying mid-boot —
 # we hit this exact failure on the first TRT deploy attempt).
 #
-# Our base is cuda:12.4.1 and our build pod is also CUDA 12.4. The
-# latest libnvinfer10 NVIDIA ships for CUDA 12.4 specifically is
-# 10.1.0.27 (apt-cache madison libnvinfer10 confirms; newer TRT
-# releases are only built against CUDA 12.5+ or 13.x). Both sides
-# pinned to that version: pip install tensorrt==10.1.0 on the build
-# pod (see build/remote_build.py) AND apt-pinned here.
+# Pinned to TRT 10.8 / CUDA 12.8. TRT 10.8 is the first release with
+# working sm120 (Blackwell) compile (10.7 declared support but the
+# builder rejects sm120 with "Target GPU SM 120 is not supported by
+# this TensorRT release"). TRT 10.8 is only published against
+# CUDA 12.8+. apt-cache confirms 10.8.0.43-1+cuda12.8 is the highest-
+# patch 10.8. Build pod pinned to matching `pip install
+# tensorrt-cu12==10.8.0.43` in build/remote_build.py.
 #
 # python3-libnvinfer pulls in the TRT Python bindings + (transitively)
 # libnvinfer10 + libnvinfer-plugin10 — the runtime libraries TRT needs
 # at deserialize + execute. We deliberately do NOT install the
 # `tensorrt-libs` meta-package (~5 GB) because that includes the
 # builder + parser libraries we don't use at inference time.
-ARG TRT_VERSION=10.1.0.27-1+cuda12.4
+ARG TRT_VERSION=10.8.0.43-1+cuda12.8
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
