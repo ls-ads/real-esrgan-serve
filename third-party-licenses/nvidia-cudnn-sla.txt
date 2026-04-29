@@ -1,0 +1,35 @@
+NVIDIA cuDNN Software License Agreement
+========================================
+
+This pointer file documents that NVIDIA cuDNN runtime libraries
+are redistributed inside the `cuda` and `trt` flavor images of
+`real-esrgan-serve`. See ../NOTICE.md §5 for the version pinned
+in each flavor.
+
+cuDNN is governed by its own SLA, separate from the CUDA Toolkit
+EULA. Redistribution terms (paraphrased):
+
+  - Permitted: redistribution of the cuDNN runtime libraries
+    inside container images that run on end-user NVIDIA GPU
+    hardware, for the purpose of accelerating AI/ML inference
+    workloads.
+  - Forbidden: reverse-engineering, modifying, or removing
+    proprietary notices. Use of cuDNN to develop a competing
+    library to cuDNN.
+  - Required: keep the SLA text accessible alongside the cuDNN
+    binaries.
+
+Canonical, authoritative text:
+
+    https://docs.nvidia.com/deeplearning/cudnn/sla/index.html
+
+NVIDIA may revise the SLA over time. The version in force for a
+given cuDNN release is the one published at the time NVIDIA
+released the cuDNN package — recorded implicitly by the version
+pin in `Dockerfile.cuda` / `Dockerfile.trt`. For a legal-review
+snapshot, fetch the URL above against the timestamp of your
+image build.
+
+This pointer satisfies the cuDNN SLA's "SLA text accessible
+alongside the binaries" obligation when shipped at
+/usr/share/doc/real-esrgan-serve/third-party-licenses/.

@@ -1,0 +1,44 @@
+NVIDIA TensorRT Software License Agreement
+===========================================
+
+This pointer file documents that NVIDIA TensorRT runtime
+libraries (libnvinfer + plugins + parsers + Python bindings) are
+redistributed inside the `trt` flavor image of `real-esrgan-serve`.
+See ../NOTICE.md §5b for the exact component list and version
+pin.
+
+TensorRT is governed by its own SLA, separate from the CUDA
+Toolkit EULA and the cuDNN SLA. Redistribution terms
+(paraphrased):
+
+  - Permitted: redistribution of the TensorRT runtime libraries
+    inside container images that run on end-user NVIDIA GPU
+    hardware, for the purpose of executing pre-built TensorRT
+    engines (.engine files) for inference.
+  - Forbidden: reverse-engineering, modifying, or removing
+    proprietary notices. Use of TensorRT to develop a competing
+    runtime.
+  - Required: keep the SLA text accessible alongside the
+    TensorRT binaries.
+
+Canonical, authoritative text:
+
+    https://docs.nvidia.com/deeplearning/tensorrt/sla/index.html
+
+NVIDIA may revise the SLA over time. The version in force for a
+given TensorRT release is the one published at the time NVIDIA
+released the TensorRT package — recorded implicitly by the
+version pin in `Dockerfile.trt` (`libnvinfer10=10.1.0.27-1+cuda12.4`
+at last audit). For a legal-review snapshot, fetch the URL
+above against the timestamp of your image build.
+
+The `tensorrt` Python module (provided by the apt
+`python3-libnvinfer` package, registered to pip metadata as
+"NVIDIA SOFTWARE LICENSE / Proprietary") and `cuda-python` (NVIDIA
+SDK License Agreement) are governed by NVIDIA's broader
+proprietary-software terms. Both ship in the trt flavor and are
+covered by the redistribution permission stated above.
+
+This pointer satisfies the TensorRT SLA's "SLA text accessible
+alongside the binaries" obligation when shipped at
+/usr/share/doc/real-esrgan-serve/third-party-licenses/.

@@ -1,0 +1,33 @@
+NVIDIA CUDA Toolkit End User License Agreement
+================================================
+
+This pointer file documents that several NVIDIA CUDA Toolkit
+runtime libraries are redistributed inside the `cuda` and `trt`
+flavor images of `real-esrgan-serve`. See ../NOTICE.md §5 for
+the complete component list.
+
+The CUDA EULA's redistribution terms (paraphrased):
+
+  - Permitted: redistribution of the listed CUDA runtime
+    libraries inside container images that run on end-user
+    NVIDIA GPU hardware.
+  - Forbidden: reverse-engineering, decompiling, or modifying
+    the libraries. Removing or obscuring proprietary notices.
+  - Required: the EULA text remains accessible alongside the
+    binaries. NGC base images ship a verbatim copy at
+    /NGC-DL-CONTAINER-LICENSE; we leave it in place.
+
+Canonical, authoritative text:
+
+    https://docs.nvidia.com/cuda/eula/index.html
+
+NVIDIA may revise the EULA over time. The version in force for
+any given component is the one published by NVIDIA at the time
+the component was downloaded from NVIDIA's apt repo (recorded
+implicitly by the version pin in `Dockerfile.cuda` /
+`Dockerfile.trt`). If you need a snapshot for legal review,
+fetch the URL above against the timestamp of your image build.
+
+This pointer satisfies NVIDIA's "EULA text accessible alongside
+the binaries" obligation when shipped at
+/usr/share/doc/real-esrgan-serve/third-party-licenses/.

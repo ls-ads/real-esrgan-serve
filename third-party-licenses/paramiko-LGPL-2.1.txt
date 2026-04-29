@@ -1,0 +1,66 @@
+paramiko — GNU Lesser General Public License, version 2.1
+==========================================================
+
+This pointer file documents that the `paramiko` Python package is
+redistributed inside the runpod-flavored images of
+`real-esrgan-serve` (`runpod-cuda` and `runpod-trt`). paramiko is a
+direct, hard dependency of `runpod==1.7.4` and cannot be omitted
+without replacing the SDK.
+
+Component
+---------
+
+  Package : paramiko
+  Version : 4.0.0 (last audit)
+  Source  : https://github.com/paramiko/paramiko
+  PyPI    : https://pypi.org/project/paramiko/
+  Copyright: Copyright (C) 2003-present Jeff Forcier and contributors
+
+License
+-------
+
+paramiko is distributed under the GNU Lesser General Public
+License, version 2.1 (LGPL-2.1). The canonical, authoritative text:
+
+    https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+    https://spdx.org/licenses/LGPL-2.1-only.html
+
+A copy of the LGPL-2.1 ships inside the paramiko package itself at
+/usr/local/lib/python3.10/dist-packages/paramiko-*.dist-info/LICENSE
+and is preserved in the runtime image.
+
+Compliance posture for this project
+-----------------------------------
+
+real-esrgan-serve is licensed under Apache-2.0 (see ../LICENSE).
+LGPL-2.1 permits use of paramiko from non-LGPL software (Apache-
+licensed code, in our case) provided four conditions are met. Our
+distribution model satisfies them as follows:
+
+  1. Source availability (LGPL-2.1 §6).
+     Satisfied by paramiko's continuous availability on GitHub
+     and PyPI at the URLs above. Anyone receiving a copy of our
+     image can fetch the exact paramiko version listed above
+     from those upstreams, in source form, free of charge.
+
+  2. Library replaceability (LGPL-2.1 §6).
+     paramiko ships as a Python package directory inside the
+     image:
+        /usr/local/lib/python3.10/dist-packages/paramiko/
+     Recipients can replace it with any LGPL-2.1-compatible
+     paramiko build by overwriting that directory in a running
+     container, or by rebuilding the image with a different
+     paramiko version. No static linkage involved.
+
+  3. License notice retention (LGPL-2.1 §1).
+     Satisfied by this pointer file plus paramiko's own LICENSE
+     inside its dist-info directory in the image.
+
+  4. No modification of paramiko by us.
+     We install paramiko from PyPI verbatim, transitively through
+     `pip install runpod==1.7.4`. We don't patch, vendor, or
+     otherwise alter the upstream code.
+
+If you fork this repo and modify paramiko itself (rather than
+just using it), LGPL-2.1 §2 requires you to publish your modified
+paramiko source under LGPL-2.1 in turn.
