@@ -72,14 +72,40 @@ MODEL_VARIANT = os.environ.get("REAL_ESRGAN_MODEL_VARIANT", "fp16")
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Input schema (identical surface to the previous handler)
+# Input schema
+#
+# Two shapes accepted:
+#
+#   1. Single-image (legacy + ergonomic, what iosuite.io sends today):
+#        {"image_base64": "...", "output_format": "jpg"}
+#      Wrapped internally as a 1-element batch.
+#
+#   2. Batch:
+#        {"images": [{"image_base64": "..."}, {"image_base64": "..."}, ...],
+#         "output_format": "jpg",   # default for items that don't override
+#         "discard_output": false,  # benchmarking flag — skip base64 in resp
+#         "telemetry": false}       # benchmarking flag — sample GPU stats
+#
+# Batched submission amortises the per-request overhead (RunPod queue
+# pickup, image-pull check, helper subprocess setup) across N images.
+# The response shape mirrors the input — `outputs` is a parallel list,
+# one entry per input image. Designed for video-frame workloads where
+# 60 fps × 60 s = 3600 frames need to flow through with minimal
+# coordination cost.
+#
+# Payload size is the practical batch ceiling. RunPod's HTTP body cap
+# is ~20 MB, so a single request realistically carries 50-200 images
+# depending on resolution. For larger workloads, the client side
+# chunks into multiple parallel requests.
 # ───────────────────────────────────────────────────────────────────────
 class InputPayload(BaseModel):
+    """Single-image payload. Used both standalone (legacy single-image
+    requests) and as the element type inside a batch."""
     image_url: Optional[str] = None
     image_base64: Optional[str] = None
     image_path: Optional[str] = None
     output_path: Optional[str] = None
-    output_format: Literal["png", "jpg"] = "jpg"
+    output_format: Optional[Literal["png", "jpg"]] = None  # falls back to batch default
 
     @model_validator(mode="after")
     def _need_one_input(self) -> "InputPayload":
@@ -87,6 +113,46 @@ class InputPayload(BaseModel):
             raise ValueError(
                 "Provide one of image_url, image_base64, or image_path."
             )
+        return self
+
+
+class BatchPayload(BaseModel):
+    """Top-level payload accepted by the handler.
+
+    `images` is the canonical input. The single-image fields
+    (image_url/image_base64/image_path) are recognised for backwards
+    compatibility with the legacy shape and are wrapped into a
+    1-element `images` list at validation time.
+    """
+    images: Optional[list[InputPayload]] = None
+    # Legacy single-image fields. Mirrored into a 1-element batch by
+    # the validator below. Kept here so old callers don't break.
+    image_url: Optional[str] = None
+    image_base64: Optional[str] = None
+    image_path: Optional[str] = None
+    output_path: Optional[str] = None
+
+    output_format: Literal["png", "jpg"] = "jpg"
+    discard_output: bool = False
+    telemetry: bool = False
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "BatchPayload":
+        if self.images:
+            return self
+        # Wrap a legacy single-image input as a 1-element batch.
+        legacy_fields = (self.image_url, self.image_base64, self.image_path)
+        if not any(legacy_fields):
+            raise ValueError(
+                "Provide either `images: [...]` or one of image_url/image_base64/image_path."
+            )
+        self.images = [InputPayload(
+            image_url=self.image_url,
+            image_base64=self.image_base64,
+            image_path=self.image_path,
+            output_path=self.output_path,
+            output_format=self.output_format,
+        )]
         return self
 
 
@@ -353,7 +419,7 @@ def _bootstrap() -> None:
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Per-job input fetching + handler
+# Per-job input fetching + telemetry + handler
 # ───────────────────────────────────────────────────────────────────────
 def _fetch_image_bytes(payload: InputPayload, job_id: Optional[str]) -> tuple[bytes, str]:
     """Resolve `payload` to (img_bytes, source_label) for logging."""
@@ -377,6 +443,139 @@ def _fetch_image_bytes(payload: InputPayload, job_id: Optional[str]) -> tuple[by
     return r.content, str(payload.image_url)
 
 
+class TelemetrySampler:
+    """Background-thread nvidia-smi sampler. Captures GPU util / memory /
+    temperature + worker process RSS at a steady cadence during a job.
+
+    The samples are returned to the caller in the response payload (the
+    only programmatic channel back from a RunPod worker — logs are
+    console-only). Used by the benchmark harness to correlate
+    request-side timing with worker-side GPU saturation.
+
+    Sampling cost: ~5-10 ms per sample (subprocess fork + nvidia-smi
+    process start). At a 200 ms cadence that's ~5% of inference time
+    — negligible for benchmarks, defaultably-off for production.
+    """
+
+    def __init__(self, interval_s: float = 0.2):
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._samples: list[dict] = []
+        self._t0_ms: float = 0.0
+
+    def start(self) -> None:
+        self._t0_ms = time.monotonic() * 1000
+        self._stop.clear()
+        self._samples = []
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> list[dict]:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return self._samples
+
+    def _loop(self) -> None:
+        # Take one sample immediately (otherwise short jobs end before
+        # the first wait expires), then sample on the cadence.
+        first = True
+        while first or not self._stop.wait(self._interval_s):
+            first = False
+            sample = self._sample_once()
+            if sample is not None:
+                sample["t_ms"] = int(time.monotonic() * 1000 - self._t0_ms)
+                self._samples.append(sample)
+
+    @staticmethod
+    def _sample_once() -> Optional[dict]:
+        """One nvidia-smi snapshot. Returns None on any error so a brief
+        nvidia-smi hiccup doesn't poison the rest of the run."""
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                text=True, timeout=2,
+            ).strip().split("\n")[0]
+            parts = [p.strip() for p in out.split(",")]
+            return {
+                "gpu_util_pct": int(parts[0]),
+                "mem_util_pct": int(parts[1]),
+                "vram_used_mb": int(parts[2]),
+                "vram_total_mb": int(parts[3]),
+                "gpu_temp_c": int(parts[4]),
+            }
+        except (subprocess.SubprocessError, FileNotFoundError, ValueError, IndexError):
+            return None
+
+
+def _process_one_image(item: InputPayload, default_format: str,
+                       discard_output: bool, job_id: str, idx: int) -> dict:
+    """Process a single image through the warm helper. Returns the
+    per-image output entry; raises on any failure (caller decides
+    whether one bad item kills the whole batch or just this entry)."""
+    fmt = item.output_format or default_format
+    img_bytes, src_label = _fetch_image_bytes(item, job_id)
+
+    with Image.open(BytesIO(img_bytes)) as img:
+        in_w, in_h = img.size
+        if in_w > MAX_INPUT_DIM or in_h > MAX_INPUT_DIM:
+            raise ValueError(
+                f"input {in_w}x{in_h} exceeds max {MAX_INPUT_DIM}x{MAX_INPUT_DIM}"
+            )
+
+    # Per-item filenames so a single batched request doesn't clobber
+    # itself if the helper is faster than disk fsync on some items.
+    suffix = ".jpg" if fmt == "jpg" else ".png"
+    item_id = f"{job_id or 'job'}_{idx}"
+    in_path = WORKSPACE / f"{item_id}_in{Path(src_label).suffix or '.bin'}"
+    out_path = WORKSPACE / f"{item_id}_out{suffix}"
+    in_path.write_bytes(img_bytes)
+
+    t0_ms = time.monotonic() * 1000
+    result = _HELPER.upscale(in_path, out_path, job_id=item_id)
+    exec_ms = int(time.monotonic() * 1000 - t0_ms)
+    if result.get("event") != "done":
+        raise RuntimeError(result.get("msg", "helper returned unexpected event"))
+
+    output: dict = {
+        "input_resolution": f"{in_w}x{in_h}",
+        "output_resolution": f"{in_w * 4}x{in_h * 4}",
+        "output_format": fmt,
+        "exec_ms": exec_ms,
+    }
+
+    if item.output_path:
+        # Caller-specified output destination (mounted volume / shared
+        # scratch). We don't include the bytes in the response in this
+        # mode — the caller has them on disk.
+        dest = Path(item.output_path)
+        if not dest.is_absolute():
+            dest = WORKSPACE / dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(out_path.read_bytes())
+        output["output_path"] = item.output_path
+    elif discard_output:
+        # Benchmarking flag — don't ferry the bytes back. Saves time
+        # and ~50-200 KB per image on the response payload, which
+        # matters when batches are large.
+        output["output_size_bytes"] = out_path.stat().st_size
+    else:
+        out_bytes = out_path.read_bytes()
+        output["image_base64"] = base64.b64encode(out_bytes).decode("ascii")
+
+    # Cleanup scratch files; failure here shouldn't sink the job.
+    try:
+        in_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    return output
+
+
 def handler(job):
     job_id = job.get("id", "")
     # Boot-error short-circuit: if module-level init failed, every
@@ -393,73 +592,70 @@ def handler(job):
 
     try:
         try:
-            payload = InputPayload.model_validate(job.get("input", {}))
+            payload = BatchPayload.model_validate(job.get("input", {}))
         except ValidationError as e:
             log.error(f"validation: {e}", request_id=job_id)
             return {"error": str(e)}
 
-        # Pull bytes + check input dimensions before paying GPU cost
-        img_bytes, src_label = _fetch_image_bytes(payload, job_id)
-        with Image.open(BytesIO(img_bytes)) as img:
-            in_w, in_h = img.size
-            if in_w > MAX_INPUT_DIM or in_h > MAX_INPUT_DIM:
-                raise ValueError(
-                    f"input {in_w}x{in_h} exceeds max {MAX_INPUT_DIM}x{MAX_INPUT_DIM}"
-                )
+        sampler = TelemetrySampler() if payload.telemetry else None
+        if sampler:
+            sampler.start()
 
-        # Stage input + output paths for the helper. Use job_id in the
-        # filename so concurrent jobs in the same container don't clobber.
-        suffix = ".jpg" if payload.output_format == "jpg" else ".png"
-        in_path = WORKSPACE / f"{job_id or 'unknown'}_in{Path(src_label).suffix or '.bin'}"
-        out_path = WORKSPACE / f"{job_id or 'unknown'}_out{suffix}"
-        in_path.write_bytes(img_bytes)
-
-        result = _HELPER.upscale(in_path, out_path, job_id=job_id or src_label)
-        if result.get("event") != "done":
-            raise RuntimeError(result.get("msg", "helper returned unexpected event"))
-
-        out_bytes = out_path.read_bytes()
-        # Cleanup scratch files; failure here shouldn't sink the job
+        outputs: list[dict] = []
+        per_item_errors: list[dict] = []
+        batch_t0_ms = time.monotonic() * 1000
         try:
-            in_path.unlink(missing_ok=True)
-            out_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            for idx, item in enumerate(payload.images or []):
+                try:
+                    outputs.append(_process_one_image(
+                        item, payload.output_format,
+                        payload.discard_output, job_id, idx,
+                    ))
+                except Exception as e:  # noqa: BLE001
+                    # Per-item error handling: one bad image doesn't
+                    # sink the rest of the batch. Caller correlates
+                    # errors by index.
+                    log.error(f"item {idx}: {e}", request_id=job_id)
+                    per_item_errors.append({"index": idx, "error": str(e)})
+        finally:
+            samples = sampler.stop() if sampler else None
+        batch_ms = int(time.monotonic() * 1000 - batch_t0_ms)
 
-        # Diagnostics piggy-backed on every response. RunPod doesn't
-        # expose worker logs via API; this is the only programmatic
-        # channel back to the caller. Cheap (a few bytes) and lets the
-        # smoke-test verify GPU vs CPU EP without console scraping.
-        diagnostics = {
+        diagnostics: dict = {
             "providers": _HELPER.providers,
             "requested_provider": _HELPER.requested_provider,
             "model": _HELPER.model_name,
+            "batch_size": len(payload.images or []),
+            "batch_total_ms": batch_ms,
         }
-
-        # Optional: also write to a caller-specified output_path inside
-        # the container (useful when network volume is mounted)
-        if payload.output_path:
-            dest = Path(payload.output_path)
-            if not dest.is_absolute():
-                dest = WORKSPACE / dest
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(out_bytes)
-            return {
-                "output_path": payload.output_path,
-                "model": "realesrgan-x4plus",
-                "input_resolution": f"{in_w}x{in_h}",
-                "output_format": payload.output_format,
-                "_diagnostics": diagnostics,
+        if samples is not None:
+            diagnostics["telemetry"] = {
+                "samples": samples,
+                "interval_ms": int(sampler._interval_s * 1000) if sampler else 0,
             }
+        if per_item_errors:
+            diagnostics["per_item_errors"] = per_item_errors
 
-        return {
-            "image_base64": base64.b64encode(out_bytes).decode("ascii"),
+        # Single-image legacy compat: if the original input wasn't a
+        # batch and there's exactly one output, also surface its fields
+        # at the top level so old callers don't need to know about
+        # `outputs`.
+        is_legacy_shape = (
+            (job.get("input", {}).get("images") is None)
+            and len(outputs) == 1
+        )
+        resp: dict = {
+            "outputs": outputs,
             "model": "realesrgan-x4plus",
-            "input_resolution": f"{in_w}x{in_h}",
-            "output_resolution": f"{in_w * 4}x{in_h * 4}",
-            "output_format": payload.output_format,
             "_diagnostics": diagnostics,
         }
+        if is_legacy_shape:
+            single = outputs[0]
+            for k in ("image_base64", "output_path", "input_resolution",
+                      "output_resolution", "output_format"):
+                if k in single:
+                    resp[k] = single[k]
+        return resp
 
     except Exception as e:  # noqa: BLE001
         log.error(str(e), request_id=job_id)

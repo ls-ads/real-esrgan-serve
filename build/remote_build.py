@@ -441,7 +441,11 @@ def main() -> int:
 
     # Bundle locally before spinning up the pod — fail fast on a bad
     # repo state instead of after we've already started billing for GPU.
-    tarball = REPO_ROOT / "build" / "dist" / "_remote-build.tar.gz"
+    # Unique per-invocation tarball name so concurrent compiles for
+    # different GPU classes don't clobber each other's tar -czf -T -
+    # streams (we got "file changed as we read it" the first time we
+    # tried to run sm86 + sm120 compiles in parallel).
+    tarball = REPO_ROOT / "build" / "dist" / f"_remote-build-{os.getpid()}.tar.gz"
     tarball_working_tree(tarball)
 
     name = f"res-engine-{args.gpu_class}-{int(time.time())}"

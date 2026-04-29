@@ -34,6 +34,11 @@ __pycache__/
 # Local test scratch
 imgs/
 
+# Benchmark results (large, derived, regeneratable from runs)
+build/bench/results.db
+build/bench/results.db-shm
+build/bench/results.db-wal
+
 # PID files
 
 # GitHub Release Scripts

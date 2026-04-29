@@ -38,19 +38,56 @@ def test_input_payload_requires_at_least_one_image_source():
 
 
 def test_input_payload_accepts_any_single_source():
+    """InputPayload is the per-item element of a batch. output_format
+    is None by default — items inherit the batch-level default rather
+    than each carrying their own when not overridden."""
     for kwargs in (
         {"image_url": "https://example.test/x.png"},
         {"image_base64": "AAAA"},
         {"image_path": "/workspace/in.jpg"},
     ):
         p = handler.InputPayload(**kwargs)
-        assert p.output_format == "jpg"  # the default
+        assert p.output_format is None  # inherits from batch
 
 
 def test_input_payload_rejects_unsupported_format():
     """Literal["png", "jpg"] should reject "tiff", "webp" etc."""
     with pytest.raises(ValidationError):
         handler.InputPayload(image_url="x", output_format="webp")
+
+
+def test_batch_payload_wraps_legacy_single_image():
+    """The legacy shape (single image fields at the top level, no
+    `images` array) must still validate, mirrored into a 1-element
+    batch. Without this, every existing iosuite caller breaks on the
+    next deploy."""
+    p = handler.BatchPayload(image_base64="AAAA")
+    assert p.images is not None and len(p.images) == 1
+    assert p.images[0].image_base64 == "AAAA"
+    assert p.output_format == "jpg"  # batch-level default
+
+
+def test_batch_payload_explicit_images_array():
+    p = handler.BatchPayload(
+        images=[
+            {"image_base64": "AAAA"},
+            {"image_url": "https://example.test/x.png"},
+        ],
+        output_format="png",
+        discard_output=True,
+        telemetry=True,
+    )
+    assert len(p.images) == 2
+    assert p.discard_output is True
+    assert p.telemetry is True
+
+
+def test_batch_payload_rejects_empty_input():
+    """Neither `images` nor any single-image field provided. The
+    handler shouldn't dispatch a 0-length batch — that's an upstream
+    bug, not a benign case."""
+    with pytest.raises(ValidationError):
+        handler.BatchPayload(output_format="jpg")
 
 
 # ────────────────────────────────────────────────────────────────────
