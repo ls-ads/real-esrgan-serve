@@ -63,7 +63,8 @@ def _build_matrix(image_tag_cuda: str, image_tag_trt: str) -> list[tuple]:
 
 
 def _deploy(client: rpd.RunPodClient, gpu_class: str, image: str,
-            endpoint_name: str, auth_id: Optional[str]) -> str:
+            endpoint_name: str, auth_id: Optional[str],
+            workers_max: int = 2) -> str:
     """Create endpoint via runpod_deploy.deploy_endpoint(). Returns
     the endpoint id. Re-uses the deploy module so we benefit from its
     validated template + endpoint mutations + idempotency."""
@@ -74,7 +75,7 @@ def _deploy(client: rpd.RunPodClient, gpu_class: str, image: str,
         image=image,
         gpu_class=gpu_class,
         endpoint_name=endpoint_name,
-        workers_max=2,
+        workers_max=workers_max,
         idle_timeout=10,    # short — we want cold workers between runs
         container_disk_gb=10,
     )
@@ -122,6 +123,16 @@ def _run_one(api_key: str, *, endpoint_id: str, gpu_class: str,
                     concurrency=4, jobs_per_worker=4))
             elif name == "image_size_sweep":
                 ws.append(workloads.workload_image_size_sweep())
+            elif name == "concurrency_sweep":
+                # Multi-pass: same endpoint, sustained at increasing
+                # concurrency. Reveals where RunPod's queue scheduler
+                # + worker pool stops scaling. Levels capped at 5
+                # because that's the standard RunPod account-wide
+                # workersMax quota; raise both this and --workers-max
+                # if your account has a higher limit.
+                for c in (1, 2, 4, 5):
+                    ws.append(workloads.workload_sustained_concurrent(
+                        concurrency=c, jobs_per_worker=4))
             else:
                 raise SystemExit(f"unknown workload: {name}")
 
@@ -147,9 +158,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="restrict to a subset of flavors (repeatable)")
     p.add_argument("--workloads", action="append", default=None,
                    choices=["cold_start", "batch_sweep",
-                            "sustained_concurrent", "image_size_sweep"],
+                            "sustained_concurrent", "image_size_sweep",
+                            "concurrency_sweep"],
                    help="restrict to a subset of workloads per pair "
-                        "(repeatable). Default = standard trio.")
+                        "(repeatable). Default = standard trio. "
+                        "concurrency_sweep does multi-pass sustained "
+                        "at c=1/4/8/16; pair with --workers-max=16.")
+    p.add_argument("--workers-max", type=int, default=2,
+                   help="endpoint workersMax. Default 2 keeps cost low; "
+                        "raise for concurrency_sweep so the scheduler has "
+                        "headroom (otherwise we measure queueing, not "
+                        "parallel throughput).")
     args = p.parse_args(argv)
 
     api_key = os.environ.get("RUNPOD_API_KEY")
@@ -178,7 +197,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"\n[sweep] === {i}/{len(matrix)} {flavor}/{gpu_class} === "
               f"image={image_tag}", file=sys.stderr)
         try:
-            endpoint_id = _deploy(rp, gpu_class, image_tag, endpoint_name, auth_id)
+            endpoint_id = _deploy(rp, gpu_class, image_tag, endpoint_name, auth_id,
+                                  workers_max=args.workers_max)
             print(f"[sweep] endpoint id: {endpoint_id}", file=sys.stderr)
             # Brief pause: workers idle out (idle_timeout=10), so the
             # cold_start workload's first job actually hits a cold spawn.
