@@ -162,6 +162,14 @@ class TrtSession:
         self._engine = engine
         self._context = engine.create_execution_context()
 
+        # Engine may carry one or two optimisation profiles (compile_engine.py
+        # builds two: profile 0 = single-image / full size range, profile
+        # 1 = batched / smaller size range). On each `run` we pick the
+        # right profile based on the input shape and switch contexts via
+        # set_optimization_profile_async if needed.
+        self._num_profiles = engine.num_optimization_profiles
+        self._current_profile = -1  # forces explicit set on first run
+
         # Resolve input/output tensor names. TRT 10 surfaces these via
         # get_tensor_name + get_tensor_mode rather than the deprecated
         # binding-index API.
@@ -210,11 +218,22 @@ class TrtSession:
         chw = np.ascontiguousarray(chw)
 
         n, c, h, w = chw.shape
+        # Pick the profile that this shape fits in. Profile 0 is the
+        # single-image profile (full size range, batch=1 only); profile
+        # 1 is the batched profile (smaller size range, batch up to
+        # max_batch). Single-engine builds (legacy) only have profile 0.
+        target_profile = self._select_profile(n, h, w)
+        if target_profile != self._current_profile:
+            self._context.set_optimization_profile_async(target_profile, self._stream)
+            cudart.cudaStreamSynchronize(self._stream)  # profile switch is stream-bound
+            self._current_profile = target_profile
+
         if not self._context.set_input_shape(self._input_name, (n, c, h, w)):
             raise RuntimeError(
                 f"set_input_shape({n},{c},{h},{w}) rejected — outside the "
-                f"engine's optimisation profile (min/opt/max). Re-build the "
-                f"engine with a profile that covers this resolution."
+                f"engine's optimisation profile {target_profile} (min/opt/max). "
+                f"Re-build the engine with a profile that covers this "
+                f"resolution, or split the request so each image fits."
             )
         out_shape = tuple(self._context.get_tensor_shape(self._output_name))
 
@@ -245,6 +264,38 @@ class TrtSession:
         err, = cudart.cudaStreamSynchronize(self._stream)
         _check_cudart(cudart, err, "cudaStreamSynchronize")
         return host_out
+
+    def _select_profile(self, n: int, h: int, w: int) -> int:
+        """Choose the optimisation profile that admits (n, h, w).
+
+        Single-engine profile builds (legacy / one-profile) → 0.
+
+        Two-profile engines (the standard build):
+          n == 1 → profile 0. Profile 0 covers the full size range
+            (1×64x64 to 1×1280x1280) and is tuned for opt=720×720,
+            so it picks better tactics for single-image requests at
+            arbitrary sizes than profile 1 (which has opt at the
+            batched corner 4×512×512 — measurably slower at 720×720
+            batch=1; ~20 % regression observed during validation).
+          n > 1 → profile 1 if (n, h, w) fits its (max_n, max_h,
+            max_w); else FAIL — the request shape is unsupported.
+
+        Mixed-shape batches must be split upstream — handler.py's
+        _process_batch does that. Reaching here with n>1 + an
+        oversize shape is a caller bug."""
+        if self._num_profiles < 2:
+            return 0
+        if n == 1:
+            return 0
+        prof1_max = self._engine.get_tensor_profile_shape(self._input_name, 1)[2]
+        max_n, _, max_h, max_w = prof1_max
+        if n > max_n or h > max_h or w > max_w:
+            raise RuntimeError(
+                f"batched request (n={n}, h={h}, w={w}) exceeds profile 1 max "
+                f"(n={max_n}, h={max_h}, w={max_w}). Split the request into "
+                f"smaller groups upstream."
+            )
+        return 1
 
     def _ensure_buffers(self, in_nbytes: int, out_nbytes: int) -> None:
         cudart = self._cudart
@@ -439,7 +490,32 @@ def run_one_shot(args: argparse.Namespace) -> int:
 
 def run_serve(args: argparse.Namespace) -> int:
     """Daemon mode: load model once, then process JSONL jobs from stdin
-    until EOF. Errors on a single job emit an event but do not exit."""
+    until EOF. Errors on a single job emit an event but do not exit.
+
+    Two frame shapes accepted:
+
+      Single image (legacy + ergonomic):
+        {"id": "...", "input": "/path/to/in.jpg", "output": "/path/to/out.jpg"}
+        → emits {"event": "done", "id": "...", "output": "/path/to/out.jpg"}
+
+      Batched (same shape across all items):
+        {"id": "...",
+         "inputs":  ["in1.jpg", "in2.jpg", ...],
+         "outputs": ["out1.jpg", "out2.jpg", ...]}
+        → emits {"event": "done", "id": "...",
+                 "results": [{"output": "out1.jpg"}, ...],
+                 "batched": true}
+
+    The batched path stacks the per-image NCHW tensors along axis 0
+    (so all images must have the same H,W — the caller is expected
+    to group by shape before sending), runs ONE forward pass, then
+    slices the output back into per-image entries. That collapses
+    N forward passes (with their N × set_input_shape + N × launch
+    overhead) into one — the single biggest perf opportunity the
+    sweep flagged.
+    """
+    import numpy as np  # type: ignore[import-not-found]
+
     model = Path(args.model)
     session = _load_session(model, args.gpu_id, json_events=True,
                             provider=args.provider)
@@ -463,6 +539,15 @@ def run_serve(args: argparse.Namespace) -> int:
             continue
 
         job_id = job.get("id", "")
+
+        # Branch on shape: `inputs` (plural) → batched; `input` → single.
+        if "inputs" in job and "outputs" in job:
+            try:
+                _serve_one_batch(session, job, job_id, np)
+            except Exception as e:  # noqa: BLE001
+                _emit(True, event="error", id=job_id, msg=str(e))
+            continue
+
         try:
             chw, w, h = _preprocess(Path(job["input"]))
             result = _run_inference(session, chw)
@@ -471,6 +556,55 @@ def run_serve(args: argparse.Namespace) -> int:
         except Exception as e:  # noqa: BLE001
             _emit(True, event="error", id=job_id, msg=str(e))
     return 0
+
+
+def _serve_one_batch(session, job: dict, job_id: str, np) -> None:
+    """Batched JSONL handler. All inputs must already share the same
+    (H, W) — the handler-side router (handler.py:_process_one_image)
+    is responsible for grouping. We re-validate here as a safety net
+    and raise loudly if violated, rather than silently truncating."""
+    inputs = [Path(p) for p in job["inputs"]]
+    outputs = [Path(p) for p in job["outputs"]]
+    if len(inputs) != len(outputs):
+        raise ValueError(f"inputs/outputs length mismatch: "
+                         f"{len(inputs)} vs {len(outputs)}")
+    if not inputs:
+        raise ValueError("empty batch")
+
+    # Preprocess each, validate same shape, stack into NCHW.
+    chws = []
+    ref_shape = None
+    for p in inputs:
+        chw, _, _ = _preprocess(p)  # shape (1, 3, h, w)
+        if ref_shape is None:
+            ref_shape = chw.shape
+        elif chw.shape != ref_shape:
+            raise ValueError(
+                f"batch contains heterogeneous shapes — first {ref_shape}, "
+                f"then {chw.shape} at {p.name}. Group by shape upstream."
+            )
+        chws.append(chw)
+    # Stack along the existing batch dim; each chw is already (1,3,H,W).
+    batched = np.concatenate(chws, axis=0)
+
+    # _run_inference returns a list of arrays — for both ORT and
+    # TrtSession the first entry is the NCHW output. _postprocess
+    # expects a 4-D NCHW tensor; we pass slices so each item lands
+    # at its own output path.
+    result = _run_inference(session, batched)
+    out_tensor = result[0]  # shape (N, 3, 4H, 4W)
+
+    per_item: list[dict] = []
+    for i, out_path in enumerate(outputs):
+        # _postprocess_and_save consumes `out_tensor[0]` (drops batch
+        # dim). Pass a 1-element slice so the existing helper stays
+        # path-agnostic between single + batched callers.
+        single = out_tensor[i:i + 1]
+        _postprocess_and_save(single, out_path)
+        per_item.append({"output": str(out_path)})
+
+    _emit(True, event="done", id=job_id, batched=True,
+          results=per_item, batch_size=len(inputs))
 
 
 def main() -> int:

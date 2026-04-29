@@ -36,7 +36,7 @@
       "bytes": 36954788,
       "license": "BSD-3-Clause (Real-ESRGAN upstream)",
       "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
-      "notes": "TensorRT 10.1 engine for sm89 — works on any sm89 GPU (RTX 4090, RTX 4080, L4, L40, L40S, RTX 6000 Ada, RTX 4000 Ada). Built on L40S; RTX 4090 secure-cloud capacity for the required driver tier was exhausted at compile time."
+      "notes": "TensorRT 10.1 single-profile engine for sm89 — works on any sm89 GPU (RTX 4090, L4, L40, L40S, RTX 6000 Ada, RTX 4000 Ada). Built on L40S. (A dual-profile _b4 variant exists on the release but is NOT in this manifest — it had a 5-22x per-image regression, see FOLLOWUPS.md.)"
     },
     {
       "name": "realesrgan-x4plus",
@@ -50,7 +50,7 @@
       "bytes": 36377468,
       "license": "BSD-3-Clause (Real-ESRGAN upstream)",
       "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
-      "notes": "TensorRT 10.1 engine for sm86 — works on any sm86 GPU (RTX 3090, RTX 3090 Ti, A40, A6000, A5000, A4000, A4500, RTX 2000 Ampere). Built on A40."
+      "notes": "TensorRT 10.1 single-profile engine for sm86 — works on any sm86 GPU (RTX 3090, A40, A6000, A5000, A4000, A4500). Built on A40. (A dual-profile _b4 variant exists on the release but is NOT in this manifest — see FOLLOWUPS.md.)"
     }
   ]
 }

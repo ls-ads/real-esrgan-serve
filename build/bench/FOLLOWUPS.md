@@ -25,6 +25,14 @@ users mostly aren't on — defer until there's a real ask.
 
 ## 1. True batched inference
 
+**Status: partially implemented + reverted, after a real perf
+regression on the first attempt.** The handler routing
+(`handler.py:_process_batch`), helper protocol
+(`runtime/upscaler.py` `_serve_one_batch`), and TrtSession
+profile-selection are all in place — they're DORMANT until a
+working batched engine ships. See "Why dormant" below for what
+went wrong on the first attempt.
+
 **The problem the sweep surfaced.** Per-image exec time is flat
 across batch sizes (575 ms at b=1 == 565 ms at b=64 on l40s/trt).
 That's because `_process_one_image` in `handler.py` iterates the
@@ -34,6 +42,57 @@ queue overhead, not GPU work. Average GPU utilisation sits at
 33–72% — the rest is per-image setup overhead (`set_input_shape`,
 buffer alloc/copy, exec launch) for a forward pass too short to hide
 those costs behind.
+
+**Why dormant: the dual-profile engine had a 5-22× regression.**
+The first attempt built **dual-profile** engines:
+profile 0 = single-image / full size range,
+profile 1 = batched (max 4×720×720). Math constraint: TRT's INT32
+elem-count cap (2^31 ≈ 2.15B) over Real-ESRGAN's intermediate
+feature maps means a single profile can only span batch=1 at full
+size range OR batched at smaller size — not both. Hence dual
+profiles.
+
+The dual-profile engine compiled but **per-image perf regressed**
+on rtx-4090 trt at 720×720:
+
+  - Batch=1: 870 ms (was 600 ms with single-profile) — 1.5× slower
+  - Batch=4: 15.4 s/image (was 600 ms each) — 22× slower
+
+Likely cause: TRT's tactic search has to pick implementations that
+fit BOTH profiles' memory budgets. The shared-budget tactics are
+markedly less efficient than what a single-profile engine picks.
+The engine compiled on L40S (48 GB) — even there, the build-time
+tactic search hit "Tactic Device request: 51 GB Available: 45 GB"
+warnings, suggesting the optimal tactics didn't fit and TRT fell
+back to slower ones.
+
+**Path forward: ship two SEPARATE engines per arch.** Rather than
+fighting TRT's shared-budget tactic selection, build two distinct
+engines:
+
+  - `<gpu>-<arch>-trt<v>_fp16.engine`     — single-profile, batch=1,
+    full size range up to 1280×1280 (the existing artifact).
+  - `<gpu>-<arch>-trt<v>_fp16_batched.engine` — single-profile,
+    batch=2..4, smaller size range up to 720×720. Tuned
+    independently; tactic selection isn't constrained by the
+    single-image profile's memory budget.
+
+The handler picks at request time: small same-shape group → batched
+engine; single-image OR oversize → single engine. WarmHelper would
+hold two TrtSession instances and route by input shape. ~150 LOC
+beyond the dormant routing already in handler.py. Engine fetch
+cost grows from 1× to 2× per cold start but the engines are ~36 MB
+each — adds ~36 MB / ~1 sec to cold start.
+
+Status of the existing plumbing (already on main):
+
+  - `runtime/upscaler.py` has `TrtSession._select_profile` for
+    multi-profile engines + `_serve_one_batch` JSONL handler. Both
+    are dormant until a multi-batch engine ships.
+  - `providers/runpod/handler.py` has `_process_batch` that groups
+    items by shape and `WarmHelper.upscale_batch`. The grouping
+    runs on every request but currently iterates within groups
+    (single-image upscale calls) — same wall-time as pre-batching.
 
 **Why it's a small change.** The .onnx already exports with
 `{0: "batch_size"}` declared as a dynamic axis (see

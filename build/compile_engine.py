@@ -140,7 +140,36 @@ def compile_engine(
     out_path: Path,
     workspace_bytes: int,
     fp16: bool,
+    max_batch: int = 4,
+    opt_batch: int = 4,
+    batched_max_dim: int = 720,
 ) -> None:
+    """Build a Real-ESRGAN x4 TRT engine with two optimisation profiles:
+
+      Profile 0 — single-image, full size range
+        min=(1, 3, 64, 64), opt=(1, 3, 720, 720), max=(1, 3, 1280, 1280)
+
+      Profile 1 — batched, smaller size range
+        min=(1, 3, 64, 64), opt=(opt_batch, 3, 512, 512),
+        max=(max_batch, 3, batched_max_dim, batched_max_dim)
+
+    Why two profiles. Real-ESRGAN's intermediate feature maps after the
+    2× pixel-shuffles are `(batch × 64 × 4H × 4W)` elements. TRT's
+    INT32 element-count limit (2^31 ≈ 2.15B) caps the product:
+
+        batch × 64 × (4 × max_dim)² < 2^31
+        ⇒ batch × max_dim² ≲ 2.1M
+
+    At max_dim=1280, that constrains max_batch to 1 — no batched
+    profile fits at the full size range. Two profiles fix it: profile
+    0 keeps the full size range for single-image requests; profile 1
+    enables batched inference for smaller images (where most video-
+    frame workloads live). The TrtSession in runtime/upscaler.py
+    picks the profile per request based on the input shape.
+
+    Engine size grows ~50% from the wider tactic search across two
+    profiles; build time grows from ~4 min to ~12 min on a 4090.
+    """
     try:
         import tensorrt as trt
     except ImportError as e:
@@ -148,6 +177,9 @@ def compile_engine(
 
     print(f"[B] building engine from {onnx_path.name}")
     print(f"[B] workspace = {workspace_bytes / (1<<30):.1f} GiB, fp16 = {fp16}")
+    print(f"[B] profile 0 (single):  min=1×64x64  opt=1×720x720  max=1×1280x1280")
+    print(f"[B] profile 1 (batched): min=1×64x64  opt={opt_batch}×512x512  "
+          f"max={max_batch}×{batched_max_dim}x{batched_max_dim}")
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -167,20 +199,32 @@ def compile_engine(
     if fp16:
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # Optimisation profile — Real-ESRGAN takes (1, 3, H, W) where H,W
-    # vary. Min/opt/max here let TRT pick tactics that work across the
-    # whole input range without rebuilding per resolution. The 1280x1280
-    # ceiling matches our handler's input cap.
-    profile = builder.create_optimization_profile()
-    profile.set_shape(
+    # Profile 0: single-image, full size range — keeps backwards
+    # compatibility with the original engine. Used by the handler for
+    # any request where N=1 OR the per-image dim exceeds the batched
+    # profile's cap.
+    profile_single = builder.create_optimization_profile()
+    profile_single.set_shape(
         "input",
         min=(1, 3, 64, 64),
-        opt=(1, 3, 720, 720),    # the median iosuite.io upload size
-        max=(1, 3, 1280, 1280),  # the handler's accepted maximum
+        opt=(1, 3, 720, 720),
+        max=(1, 3, 1280, 1280),
     )
-    config.add_optimization_profile(profile)
+    config.add_optimization_profile(profile_single)
 
-    print("[B] compiling — this can take 10–30 min on first build")
+    # Profile 1: batched, smaller size range. INT32 cap math (above)
+    # forces this size×batch trade-off. Default 4×720 fits comfortably
+    # (1.06B at opt, 2.12B at max — both under 2^31).
+    profile_batched = builder.create_optimization_profile()
+    profile_batched.set_shape(
+        "input",
+        min=(1, 3, 64, 64),
+        opt=(opt_batch, 3, 512, 512),
+        max=(max_batch, 3, batched_max_dim, batched_max_dim),
+    )
+    config.add_optimization_profile(profile_batched)
+
+    print(f"[B] compiling — this can take 10-30 min on first build")
     engine_bytes = builder.build_serialized_network(network, config)
     if engine_bytes is None:
         sys.exit("[B] engine build failed (TRT logger should have printed why)")
@@ -202,6 +246,18 @@ def main() -> int:
     p.add_argument("--trt-version", help="e.g. 10.8 (overrides auto-detect)")
     p.add_argument("--workspace-bytes", type=int, default=DEFAULT_WORKSPACE_BYTES)
     p.add_argument("--fp32", action="store_true", help="disable FP16 (default: FP16 on)")
+    p.add_argument("--max-batch", type=int, default=4,
+                   help="upper bound for the BATCHED profile (engine has "
+                        "a separate single-image profile that always covers "
+                        "1..1280). 4 fits within TRT's INT32 elem-count "
+                        "limit at the batched-profile's max image dim.")
+    p.add_argument("--opt-batch", type=int, default=4,
+                   help="batched profile's autotune-target batch size.")
+    p.add_argument("--batched-max-dim", type=int, default=720,
+                   help="batched profile's max image dim (square). 720 is "
+                        "the largest that fits batch=4 under TRT's INT32 "
+                        "elem-count cap. Lower this to enable larger "
+                        "batches at the cost of size range.")
     args = p.parse_args()
 
     if not args.onnx.exists():
@@ -217,13 +273,20 @@ def main() -> int:
     args.trt_version = args.trt_version or _detect_trt_version()
 
     precision = "fp32" if args.fp32 else "fp16"
+    # Include max_batch in the filename so the new b16-profile engines
+    # don't collide with the old b1-profile artefacts already on
+    # GH Releases. Manifest sha256 is the canonical identity, but the
+    # filename helps humans + log inspection at a glance.
     out_name = (
         f"realesrgan-x4plus-{args.gpu_class}-{args.sm_arch}-"
-        f"trt{args.trt_version}_{precision}.engine"
+        f"trt{args.trt_version}_{precision}_b{args.max_batch}.engine"
     )
     out_path = args.output / out_name
 
-    compile_engine(args.onnx, out_path, args.workspace_bytes, fp16=not args.fp32)
+    compile_engine(args.onnx, out_path, args.workspace_bytes,
+                   fp16=not args.fp32,
+                   max_batch=args.max_batch, opt_batch=args.opt_batch,
+                   batched_max_dim=args.batched_max_dim)
     return 0
 
 

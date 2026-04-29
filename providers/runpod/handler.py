@@ -358,6 +358,28 @@ class WarmHelper:
             "input": str(input_path),
             "output": str(output_path),
         })
+        return self._send_and_wait(frame, job_id, timeout)
+
+    def upscale_batch(self, input_paths: list[Path], output_paths: list[Path],
+                      job_id: str, timeout: float = 240.0) -> dict:
+        """Submit a same-shape batch to the helper. The helper stacks
+        the N images into one NCHW tensor and runs a single forward
+        pass — the perf payoff that the FOLLOWUPS plan flagged.
+
+        Caller MUST guarantee all input_paths point at images of the
+        same (H, W). The helper re-validates and raises loudly on
+        violation; mixed-shape batches are caller-side bugs.
+
+        Timeout default is 2× single-image because batched forward
+        passes take longer total (though faster per-image)."""
+        frame = json.dumps({
+            "id": job_id,
+            "inputs":  [str(p) for p in input_paths],
+            "outputs": [str(p) for p in output_paths],
+        })
+        return self._send_and_wait(frame, job_id, timeout)
+
+    def _send_and_wait(self, frame: str, job_id: str, timeout: float) -> dict:
         # Subscribe before send to avoid race with a fast helper
         q: Queue = Queue()
         self._pending[job_id] = q
@@ -511,11 +533,15 @@ class TelemetrySampler:
             return None
 
 
-def _process_one_image(item: InputPayload, default_format: str,
-                       discard_output: bool, job_id: str, idx: int) -> dict:
-    """Process a single image through the warm helper. Returns the
-    per-image output entry; raises on any failure (caller decides
-    whether one bad item kills the whole batch or just this entry)."""
+def _stage_one_item(item: InputPayload, default_format: str, job_id: str,
+                    idx: int) -> tuple[Path, Path, int, int, str, dict]:
+    """Decode + size-check + stage to disk for a single batch item.
+    Returns (in_path, out_path, in_w, in_h, fmt, partial_output_dict).
+
+    Split out from the helper-call step so the orchestrator can stage
+    every item up front, then group by shape, then dispatch batched
+    helper calls for each group. Lets us keep the per-item failure
+    isolation while sharing the helper's batched forward pass."""
     fmt = item.output_format or default_format
     img_bytes, src_label = _fetch_image_bytes(item, job_id)
 
@@ -526,31 +552,29 @@ def _process_one_image(item: InputPayload, default_format: str,
                 f"input {in_w}x{in_h} exceeds max {MAX_INPUT_DIM}x{MAX_INPUT_DIM}"
             )
 
-    # Per-item filenames so a single batched request doesn't clobber
-    # itself if the helper is faster than disk fsync on some items.
     suffix = ".jpg" if fmt == "jpg" else ".png"
     item_id = f"{job_id or 'job'}_{idx}"
     in_path = WORKSPACE / f"{item_id}_in{Path(src_label).suffix or '.bin'}"
     out_path = WORKSPACE / f"{item_id}_out{suffix}"
     in_path.write_bytes(img_bytes)
 
-    t0_ms = time.monotonic() * 1000
-    result = _HELPER.upscale(in_path, out_path, job_id=item_id)
-    exec_ms = int(time.monotonic() * 1000 - t0_ms)
-    if result.get("event") != "done":
-        raise RuntimeError(result.get("msg", "helper returned unexpected event"))
-
-    output: dict = {
+    partial = {
         "input_resolution": f"{in_w}x{in_h}",
         "output_resolution": f"{in_w * 4}x{in_h * 4}",
         "output_format": fmt,
-        "exec_ms": exec_ms,
     }
+    return in_path, out_path, in_w, in_h, fmt, partial
+
+
+def _finalise_one_item(*, item: InputPayload, in_path: Path, out_path: Path,
+                       partial: dict, exec_ms: int,
+                       discard_output: bool) -> dict:
+    """Read out_path, apply discard_output / explicit-path routing,
+    return the per-item output dict. Cleans up scratch files."""
+    output = dict(partial)
+    output["exec_ms"] = exec_ms
 
     if item.output_path:
-        # Caller-specified output destination (mounted volume / shared
-        # scratch). We don't include the bytes in the response in this
-        # mode — the caller has them on disk.
         dest = Path(item.output_path)
         if not dest.is_absolute():
             dest = WORKSPACE / dest
@@ -558,15 +582,11 @@ def _process_one_image(item: InputPayload, default_format: str,
         dest.write_bytes(out_path.read_bytes())
         output["output_path"] = item.output_path
     elif discard_output:
-        # Benchmarking flag — don't ferry the bytes back. Saves time
-        # and ~50-200 KB per image on the response payload, which
-        # matters when batches are large.
         output["output_size_bytes"] = out_path.stat().st_size
     else:
         out_bytes = out_path.read_bytes()
         output["image_base64"] = base64.b64encode(out_bytes).decode("ascii")
 
-    # Cleanup scratch files; failure here shouldn't sink the job.
     try:
         in_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
@@ -574,6 +594,89 @@ def _process_one_image(item: InputPayload, default_format: str,
         pass
 
     return output
+
+
+def _process_batch(items: list[InputPayload], default_format: str,
+                   discard_output: bool, job_id: str) -> tuple[list[dict], list[dict]]:
+    """Stage every item, group by shape, dispatch each group through
+    the helper (batched if N > 1, single if N == 1), match outputs
+    back to original indices.
+
+    Returns (outputs_in_original_order, per_item_errors). `outputs`
+    has gaps (None) for failed items so indices remain meaningful for
+    the caller's diagnostic output.
+
+    Why group by shape: TRT engines with dynamic-shape profiles run
+    one shape per forward pass (set_input_shape sets it for the next
+    execute). To batch effectively, all images in a single forward
+    pass must share (H, W) — hence the upfront grouping. Mixed-shape
+    requests still work, they just don't get batching's amortisation.
+    """
+    # Stage everything; collect per-item state. Errors during staging
+    # (decode, oversize) bypass the helper entirely.
+    staged: list[Optional[tuple]] = [None] * len(items)
+    errors: list[dict] = []
+    for idx, item in enumerate(items):
+        try:
+            staged[idx] = _stage_one_item(item, default_format, job_id, idx)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"item {idx} stage: {e}", request_id=job_id)
+            errors.append({"index": idx, "error": str(e)})
+
+    # Group by (in_w, in_h). Order within a group matches original
+    # request order so caller-visible idx is preserved.
+    groups: dict[tuple[int, int], list[int]] = {}
+    for idx, st in enumerate(staged):
+        if st is None:
+            continue
+        _, _, w, h, _, _ = st
+        groups.setdefault((w, h), []).append(idx)
+
+    # Within each shape group, dispatch one helper call per image.
+    #
+    # The intent of grouping was to call _HELPER.upscale_batch for
+    # groups of size > 1, collapsing N forward passes into one. The
+    # plumbing for that exists end-to-end — handler.WarmHelper has
+    # upscale_batch, runtime/upscaler.py has the batched JSONL
+    # protocol, TrtSession picks the right TRT optimisation profile
+    # — but the production engines today are single-profile and
+    # reject batch>1 at set_input_shape. Dual-profile engines we
+    # tried showed a 5-22× per-image regression because TRT had to
+    # pick conservative tactics that fit both profiles' memory
+    # budgets at build time. See FOLLOWUPS.md "True batched inference"
+    # for the path forward (likely two separate engines per arch).
+    #
+    # Until that's resolved we iterate within groups — same wall-time
+    # behaviour as the pre-grouping handler, but the structure is in
+    # place to swap in a single batched call once the engine can do it.
+    outputs: list[Optional[dict]] = [None] * len(items)
+    for shape, indices in groups.items():
+        for i in indices:
+            in_p, out_p, _, _, _, partial = staged[i]
+            item_id = f"{job_id or 'job'}_{shape[0]}x{shape[1]}_{i}"
+            t0_ms = time.monotonic() * 1000
+            try:
+                result = _HELPER.upscale(in_p, out_p, job_id=item_id)
+                exec_ms = int(time.monotonic() * 1000 - t0_ms)
+                if result.get("event") != "done":
+                    raise RuntimeError(result.get("msg", "helper returned unexpected event"))
+                outputs[i] = _finalise_one_item(
+                    item=items[i], in_path=in_p, out_path=out_p,
+                    partial=partial, exec_ms=exec_ms,
+                    discard_output=discard_output,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error(f"item {i}: {e}", request_id=job_id)
+                errors.append({"index": i, "error": str(e)})
+                # Best-effort cleanup so a failed item doesn't leak.
+                try:
+                    in_p.unlink(missing_ok=True)
+                    out_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    final_outputs = [o for o in outputs if o is not None]
+    return final_outputs, errors
 
 
 def handler(job):
@@ -601,22 +704,14 @@ def handler(job):
         if sampler:
             sampler.start()
 
-        outputs: list[dict] = []
-        per_item_errors: list[dict] = []
         batch_t0_ms = time.monotonic() * 1000
         try:
-            for idx, item in enumerate(payload.images or []):
-                try:
-                    outputs.append(_process_one_image(
-                        item, payload.output_format,
-                        payload.discard_output, job_id, idx,
-                    ))
-                except Exception as e:  # noqa: BLE001
-                    # Per-item error handling: one bad image doesn't
-                    # sink the rest of the batch. Caller correlates
-                    # errors by index.
-                    log.error(f"item {idx}: {e}", request_id=job_id)
-                    per_item_errors.append({"index": idx, "error": str(e)})
+            outputs, per_item_errors = _process_batch(
+                payload.images or [],
+                payload.output_format,
+                payload.discard_output,
+                job_id,
+            )
         finally:
             samples = sampler.stop() if sampler else None
         batch_ms = int(time.monotonic() * 1000 - batch_t0_ms)
