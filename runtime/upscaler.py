@@ -70,24 +70,255 @@ def _die(code: int, msg: str, json_events: bool) -> None:
     sys.exit(code)
 
 
-def _load_session(model_path: Path, gpu_id: int, json_events: bool):
-    """Load the ONNX session with the best available provider."""
+_PROVIDER_CHOICES = ("auto", "cpu", "cuda", "trt")
+
+
+def _build_providers(provider: str, gpu_id: int, available: list[str],
+                     trt_cache: Path) -> list:
+    """Translate a user-facing provider name (cpu|cuda|trt|auto) into
+    an ORT providers list. `auto` walks trt → cuda → cpu, picking the
+    first that's compiled into the wheel. Concrete picks are still
+    subject to runtime EP-init success (see _load_session)."""
+    cuda_opts = {"device_id": gpu_id}
+    trt_opts = {
+        "device_id": gpu_id,
+        "trt_fp16_enable": True,
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": str(trt_cache),
+    }
+    if provider == "cpu" or gpu_id < 0:
+        return ["CPUExecutionProvider"]
+    if provider == "cuda":
+        if "CUDAExecutionProvider" not in available:
+            raise RuntimeError(
+                "provider=cuda requested but CUDAExecutionProvider not in "
+                f"this ORT wheel. Available: {available}"
+            )
+        return [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+    if provider == "trt":
+        if "TensorrtExecutionProvider" not in available:
+            raise RuntimeError(
+                "provider=trt requested but TensorrtExecutionProvider not "
+                f"in this ORT wheel. Available: {available}"
+            )
+        # TRT first; CUDA EP next as a fallback for ops TRT doesn't
+        # support; CPU last. ORT will JIT-compile a TRT engine on
+        # first inference and cache under trt_engine_cache_path.
+        return [
+            ("TensorrtExecutionProvider", trt_opts),
+            ("CUDAExecutionProvider", cuda_opts),
+            "CPUExecutionProvider",
+        ]
+    # auto
+    if "TensorrtExecutionProvider" in available:
+        return [
+            ("TensorrtExecutionProvider", trt_opts),
+            ("CUDAExecutionProvider", cuda_opts),
+            "CPUExecutionProvider",
+        ]
+    if "CUDAExecutionProvider" in available:
+        return [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+class TrtSession:
+    """Direct TensorRT execution path. Loads a .engine produced by
+    `build/compile_engine.py`, allocates GPU I/O via cuda-python, and
+    executes via execute_async_v3.
+
+    No ONNX Runtime in the request path. The TRT image deliberately
+    omits onnxruntime-gpu (saves ~600 MB on the cold-start image
+    pull); engines are pre-built per (gpu-class, sm-arch, trt-version)
+    and fetched at worker boot, so first-request inference cost is
+    pure execute, not JIT compile.
+
+    Dynamic shape: the engine ships an optimisation profile spanning
+    min=(1,3,64,64), opt=(1,3,720,720), max=(1,3,1280,1280) — see
+    compile_engine.py. Per-request we set the actual input shape via
+    set_input_shape, ask the engine for the resulting output shape,
+    allocate a fresh output buffer (input buffer is re-allocated when
+    the request is bigger than what we already have), and execute.
+    """
+
+    def __init__(self, engine_path: Path) -> None:
+        try:
+            import tensorrt as trt  # type: ignore[import-not-found]
+            from cuda import cudart  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise RuntimeError(
+                f"TRT-direct path requires tensorrt + cuda-python: {e}"
+            ) from e
+        import numpy as np  # noqa: F401  imported here so np is loaded once
+
+        self._trt = trt
+        self._cudart = cudart
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with engine_path.open("rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        if engine is None:
+            raise RuntimeError(f"failed to deserialize engine: {engine_path}")
+        self._engine = engine
+        self._context = engine.create_execution_context()
+
+        # Resolve input/output tensor names. TRT 10 surfaces these via
+        # get_tensor_name + get_tensor_mode rather than the deprecated
+        # binding-index API.
+        self._input_name = None
+        self._output_name = None
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self._input_name = name
+            else:
+                self._output_name = name
+        if self._input_name is None or self._output_name is None:
+            raise RuntimeError(
+                f"engine missing input or output tensor "
+                f"(input={self._input_name}, output={self._output_name})"
+            )
+
+        # Cache the I/O dtypes — TRT exposes them as trt.DataType which
+        # we convert to numpy dtypes once so per-request hot path is just
+        # numpy ops + memcpys.
+        self._input_dtype = trt.nptype(engine.get_tensor_dtype(self._input_name))
+        self._output_dtype = trt.nptype(engine.get_tensor_dtype(self._output_name))
+
+        err, self._stream = cudart.cudaStreamCreate()
+        _check_cudart(cudart, err, "cudaStreamCreate")
+
+        # Per-shape device buffers; lazily (re)allocated when the
+        # requested capacity grows. We never shrink — Real-ESRGAN
+        # workloads on a given worker tend to cluster around a few input
+        # sizes, so the high-water mark is what matters.
+        self._d_input = None
+        self._d_output = None
+        self._d_input_capacity = 0
+        self._d_output_capacity = 0
+
+    def run(self, chw):  # numpy NCHW float32 → numpy NCHW (engine output dtype)
+        """Execute one forward pass. Input is host-side NCHW float32
+        (what _preprocess emits); we cast to the engine's input dtype,
+        copy HtoD, run, copy DtoH, and return the host output array."""
+        import numpy as np  # type: ignore[import-not-found]
+        trt = self._trt
+        cudart = self._cudart
+
+        if chw.dtype != self._input_dtype:
+            chw = chw.astype(self._input_dtype)
+        chw = np.ascontiguousarray(chw)
+
+        n, c, h, w = chw.shape
+        if not self._context.set_input_shape(self._input_name, (n, c, h, w)):
+            raise RuntimeError(
+                f"set_input_shape({n},{c},{h},{w}) rejected — outside the "
+                f"engine's optimisation profile (min/opt/max). Re-build the "
+                f"engine with a profile that covers this resolution."
+            )
+        out_shape = tuple(self._context.get_tensor_shape(self._output_name))
+
+        in_nbytes = int(chw.nbytes)
+        out_nbytes = int(np.prod(out_shape)) * np.dtype(self._output_dtype).itemsize
+        self._ensure_buffers(in_nbytes, out_nbytes)
+
+        # Bind device addresses for this execution. set_tensor_address
+        # is per-context state; safe to re-set every call.
+        self._context.set_tensor_address(self._input_name, int(self._d_input))
+        self._context.set_tensor_address(self._output_name, int(self._d_output))
+
+        err, = cudart.cudaMemcpyAsync(
+            int(self._d_input), chw.ctypes.data, in_nbytes,
+            cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self._stream,
+        )
+        _check_cudart(cudart, err, "cudaMemcpyAsync HtoD")
+
+        if not self._context.execute_async_v3(self._stream):
+            raise RuntimeError("execute_async_v3 returned False")
+
+        host_out = np.empty(out_shape, dtype=self._output_dtype)
+        err, = cudart.cudaMemcpyAsync(
+            host_out.ctypes.data, int(self._d_output), out_nbytes,
+            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self._stream,
+        )
+        _check_cudart(cudart, err, "cudaMemcpyAsync DtoH")
+        err, = cudart.cudaStreamSynchronize(self._stream)
+        _check_cudart(cudart, err, "cudaStreamSynchronize")
+        return host_out
+
+    def _ensure_buffers(self, in_nbytes: int, out_nbytes: int) -> None:
+        cudart = self._cudart
+        if in_nbytes > self._d_input_capacity:
+            if self._d_input is not None:
+                cudart.cudaFree(self._d_input)
+            err, self._d_input = cudart.cudaMalloc(in_nbytes)
+            _check_cudart(cudart, err, "cudaMalloc input")
+            self._d_input_capacity = in_nbytes
+        if out_nbytes > self._d_output_capacity:
+            if self._d_output is not None:
+                cudart.cudaFree(self._d_output)
+            err, self._d_output = cudart.cudaMalloc(out_nbytes)
+            _check_cudart(cudart, err, "cudaMalloc output")
+            self._d_output_capacity = out_nbytes
+
+    def get_providers(self) -> list[str]:
+        """Diagnostics surface — handler.py reads this and embeds it in
+        every job response so callers can verify the worker really ran
+        TRT-direct (not silently degraded). Mirrors ort.InferenceSession's
+        get_providers() so callers don't branch."""
+        return ["TensorrtDirect"]
+
+
+def _check_cudart(cudart, err, where: str) -> None:
+    """cuda-python returns (err, *result) tuples; non-zero err is fatal.
+    We don't try to recover — a CUDA failure mid-request means the
+    context is suspect; better to crash the helper and let the handler
+    surface a clean boot_failed than to muddle on with corrupt state."""
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"{where} failed: {err}")
+
+
+def _load_session(model_path: Path, gpu_id: int, json_events: bool,
+                  provider: str = "auto"):
+    """Load the inference session for the chosen provider. `provider`
+    is one of cpu | cuda | trt | auto.
+
+    cpu/cuda go through ONNX Runtime (model_path is a .onnx).
+    trt loads the engine directly via the TensorRT Python API
+    (model_path is a .engine). The TRT image doesn't ship ORT, so the
+    trt branch never imports onnxruntime — keeps the import lazy so the
+    image stays clean.
+
+    Strict mode: if the user asks for a specific GPU provider and ORT
+    silently drops it at session init, this raises RuntimeError instead
+    of degrading to CPU silently."""
+    if not model_path.exists():
+        _die(1, f"model file does not exist: {model_path}", json_events)
+
+    if provider == "trt":
+        # TRT-direct path. No ORT involved — the trt image deliberately
+        # omits onnxruntime-gpu (~600 MB) and uses tensorrt + cuda-python
+        # directly. model_path is a .engine pre-built for this host's GPU.
+        if model_path.suffix != ".engine":
+            raise RuntimeError(
+                f"provider=trt requires a .engine file, got {model_path.name}. "
+                f"The TRT image fetches the matching engine for this GPU's SM "
+                f"arch at boot; check handler._resolve_model_path."
+            )
+        sess = TrtSession(model_path)
+        print("[trt] direct execution path (no ORT); engine loaded",
+              file=sys.stderr, flush=True)
+        return sess
+
     try:
         import onnxruntime as ort  # type: ignore[import-not-found]
     except ImportError as e:
         _die(3, f"onnxruntime not installed: {e}", json_events)
 
-    if not model_path.exists():
-        _die(1, f"model file does not exist: {model_path}", json_events)
-
     available = ort.get_available_providers()
-    providers: list = []
-    if gpu_id >= 0 and "CUDAExecutionProvider" in available:
-        providers.append((
-            "CUDAExecutionProvider",
-            {"device_id": gpu_id},
-        ))
-    providers.append("CPUExecutionProvider")
+    trt_cache = Path("/tmp/real-esrgan-serve/trt-cache")
+    trt_cache.mkdir(parents=True, exist_ok=True)
+    providers = _build_providers(provider, gpu_id, available, trt_cache)
 
     session_options = ort.SessionOptions()
     # Reduce log noise; the Go side wants clean stdout for JSON events
@@ -99,23 +330,27 @@ def _load_session(model_path: Path, gpu_id: int, json_events: bool):
         providers=providers,
     )
 
-    # Diagnostic: ORT silently drops EPs that fail to initialize at
-    # session creation (e.g. CUDA EP can't load libcudnn / libcublas).
-    # `requested` is what we asked for; `actual` is what ORT ended up
-    # binding the session to. If actual==[CPUExecutionProvider] but we
-    # passed gpu_id>=0, ORT fell back silently and the workload is
-    # running on CPU even though the host has a GPU. Log loudly so the
-    # operator sees this in worker logs.
+    # Strict-mode verification: ORT silently drops EPs that fail to
+    # initialize at session creation. If the user asked for a specific
+    # GPU EP and it isn't in the active list, that's almost always a
+    # missing system library (libcudnn / libnvinfer) — fail loudly so
+    # the operator gets a real error in the response payload instead
+    # of mysteriously slow CPU inference.
     requested = [p[0] if isinstance(p, tuple) else p for p in providers]
     actual = sess.get_providers()
     print(f"[ort] requested EPs: {requested}", file=sys.stderr, flush=True)
     print(f"[ort] active EPs:    {actual}", file=sys.stderr, flush=True)
-    if gpu_id >= 0 and "CUDAExecutionProvider" not in actual:
-        print(f"[ort] WARNING: CUDA EP requested but not active — "
-              f"running on CPU. Likely cause: libcudnn/libcublas/"
-              f"libcudart not on the linker path.",
-              file=sys.stderr, flush=True)
-
+    must_have = {
+        "cuda": "CUDAExecutionProvider",
+    }.get(provider)
+    if must_have and must_have not in actual:
+        raise RuntimeError(
+            f"provider={provider} requested but {must_have} did not "
+            f"initialize. Active EPs: {actual}. Likely cause: missing "
+            f"system library (libcudnn / libcublas / libcudart). "
+            f"Provider=auto will degrade silently; provider=cuda is "
+            f"strict by design."
+        )
     return sess
 
 
@@ -136,12 +371,18 @@ def _preprocess(image_path: Path):
 
 
 def _run_inference(session, chw):
-    """Run ORT inference, casting input to match the model's input dtype.
-    Exported ONNX may be FP16 (smaller, fast on tensor cores) or FP32.
-    _preprocess always emits FP32, so we coerce here once based on what
-    the loaded model actually wants. Output is left in whatever dtype
-    the model produced — _postprocess_and_save handles the uint8 cast
-    at the end and clip/scale work correctly for either float dtype."""
+    """Run inference, casting input to match the model's input dtype.
+    Returns a list whose [0] is the NCHW output array (matches ORT's
+    session.run shape so _postprocess_and_save is path-agnostic).
+
+    TrtSession casts internally and handles its own buffer mgmt. ORT
+    needs us to coerce up front because the exported ONNX may be FP16
+    (smaller, fast on tensor cores) or FP32 and _preprocess always
+    emits FP32. Output is left in whatever dtype the model produced —
+    _postprocess_and_save handles the uint8 cast at the end and
+    clip/scale work correctly for either float dtype."""
+    if isinstance(session, TrtSession):
+        return [session.run(chw)]
     import numpy as np  # type: ignore[import-not-found]
     inp_meta = session.get_inputs()[0]
     if "float16" in inp_meta.type and chw.dtype != np.float16:
@@ -175,7 +416,7 @@ def run_one_shot(args: argparse.Namespace) -> int:
 
     _emit(je, event="loading_model", path=str(model))
     t0 = time.monotonic()
-    session = _load_session(model, args.gpu_id, je)
+    session = _load_session(model, args.gpu_id, je, provider=args.provider)
     _emit(je, event="model_loaded", elapsed_ms=int((time.monotonic() - t0) * 1000))
 
     _emit(je, event="preprocessing", input=str(inp))
@@ -200,12 +441,16 @@ def run_serve(args: argparse.Namespace) -> int:
     """Daemon mode: load model once, then process JSONL jobs from stdin
     until EOF. Errors on a single job emit an event but do not exit."""
     model = Path(args.model)
-    session = _load_session(model, args.gpu_id, json_events=True)
-    # Include active EPs in the ready event so the handler can surface
-    # them in job responses — RunPod's worker logs aren't reachable via
-    # API, so we route the diagnostic through the response payload
-    # instead of relying on stderr scraping.
-    _emit(True, event="ready", providers=session.get_providers())
+    session = _load_session(model, args.gpu_id, json_events=True,
+                            provider=args.provider)
+    # Include active EPs and the requested provider in the ready
+    # event so the handler can surface both in job responses —
+    # RunPod's worker logs aren't reachable via API, so we route
+    # diagnostics through the response payload instead of stderr.
+    _emit(True, event="ready",
+          providers=session.get_providers(),
+          requested_provider=args.provider,
+          model=model.name)
 
     for line in sys.stdin:
         line = line.strip()
@@ -234,6 +479,12 @@ def main() -> int:
     p.add_argument("--output", help="output image (one-shot mode)")
     p.add_argument("--model", required=True, help="path to .onnx model file")
     p.add_argument("--gpu-id", type=int, default=0, help="CUDA device id; -1 = CPU")
+    p.add_argument("--provider", choices=_PROVIDER_CHOICES, default="auto",
+                   help="execution provider: cpu | cuda | trt | auto. "
+                        "auto walks trt → cuda → cpu picking the first the "
+                        "ORT wheel was built with. cpu/cuda/trt are STRICT "
+                        "— a missing system lib raises rather than falling "
+                        "back silently.")
     p.add_argument("--json-events", action="store_true", help="emit progress as JSONL on stdout")
     p.add_argument("--serve", action="store_true", help="daemon mode: read JSONL jobs from stdin")
     args = p.parse_args()

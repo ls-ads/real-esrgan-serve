@@ -284,28 +284,32 @@ class RunPodClient:
         until the endpoint disappears from the listing or 30 s pass.
         Returns True on confirmed deletion, False otherwise. Never
         raises — callers in `finally` blocks need this contract."""
-        # Drain. Look up the endpoint's name first because RunPod's
-        # saveEndpoint mutation requires `name` in the input even for
-        # partial updates (it's a 400 GRAPHQL_VALIDATION_FAILED
-        # otherwise — undocumented quirk). If lookup fails we skip
-        # the drain entirely and rely on RunPod auto-draining
-        # workers as part of deleteEndpoint.
+        # Drain. RunPod's saveEndpoint requires both `name` AND
+        # `gpuIds` in the input even for partial updates — the
+        # input type is non-nullable and rejects updates that don't
+        # repeat them. So we have to look up both first; if either
+        # lookup fails we skip the drain entirely and rely on
+        # deleteEndpoint draining workers itself.
         name = None
+        gpu_ids = None
         try:
-            data = self.raw_query("query { myself { endpoints { id name } } }")
+            data = self.raw_query(
+                "query { myself { endpoints { id name gpuIds } } }"
+            )
             for e in data["myself"]["endpoints"]:
                 if e["id"] == endpoint_id:
                     name = e["name"]
+                    gpu_ids = e.get("gpuIds")
                     break
         except RunPodError:
             pass
 
-        if name:
+        if name and gpu_ids:
             try:
                 self.raw_query(
                     f'mutation {{ saveEndpoint(input: {{'
                     f' id: "{endpoint_id}", name: "{name}",'
-                    f' workersMin: 0, workersMax: 0'
+                    f' gpuIds: "{gpu_ids}", workersMin: 0, workersMax: 0'
                     f' }}) {{ id }} }}'
                 )
             except RunPodError as e:
@@ -341,13 +345,32 @@ class RunPodClient:
 # Job submission via the v2 REST API
 # ─────────────────────────────────────────────────────────────────────
 
-def submit_job(endpoint_id: str, api_key: str, payload: dict, timeout_s: int = 300) -> dict:
+class StuckWorkerError(RuntimeError):
+    """Raised by submit_job when the endpoint health stays in a stuck
+    state — workers in `initializing` for too long without ever
+    reaching `ready` or `running` — well before the absolute job
+    timeout. Lets the retry loop tear down + recreate quickly without
+    paying the full timeout for a known-bad host."""
+
+
+def submit_job(endpoint_id: str, api_key: str, payload: dict,
+               timeout_s: int = 240, stuck_threshold_s: int = 150) -> dict:
     """POST a job, poll status until COMPLETED or FAILED. Returns the
-    final status response (which includes timing fields). Raises
-    TimeoutError if the job is still IN_QUEUE / IN_PROGRESS past
-    `timeout_s` — caller decides whether to give up or recreate the
-    endpoint and retry."""
+    final status response (which includes timing fields).
+
+    Active stuck detection:
+      Periodically queries /health alongside /status. If we've waited
+      `stuck_threshold_s` and have never observed any worker reach
+      `ready` or `running`, raises StuckWorkerError so the caller can
+      cycle the endpoint sooner than the full timeout. A legitimately-
+      slow image pull will eventually transition through ready, so
+      "never observed progress" is a strong stuck signal even when
+      the absolute time isn't extreme.
+
+    TimeoutError raised if the job is still IN_QUEUE / IN_PROGRESS
+    past `timeout_s` — the absolute backstop."""
     submit_url = f"{RUNPOD_API_BASE}/{endpoint_id}/run"
+    health_url = f"{RUNPOD_API_BASE}/{endpoint_id}/health"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -366,14 +389,60 @@ def submit_job(endpoint_id: str, api_key: str, payload: dict, timeout_s: int = 3
 
     status_url = f"{RUNPOD_API_BASE}/{endpoint_id}/status/{job_id}"
     deadline = time.monotonic() + timeout_s
+    next_health_check = time.monotonic()  # first check immediate
+    saw_progress = False  # has any worker transitioned past initializing?
+    last_health: dict = {}
+
     while time.monotonic() < deadline:
         req = urllib.request.Request(status_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            status = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                status = json.loads(r.read())
+        except urllib.error.URLError as e:
+            print(f"[deploy] status poll transient error: {e}", file=sys.stderr)
+            time.sleep(2)
+            continue
+
         if status["status"] in ("COMPLETED", "FAILED"):
             wall_time_s = time.monotonic() - submit_t0
             status["_walltime_s"] = wall_time_s
             return status
+
+        # Side-channel health probe — every 10 s. Cheaper than
+        # status polls on RunPod's side and gives us the worker
+        # state machine, which is what reveals the stuck pattern.
+        if time.monotonic() >= next_health_check:
+            next_health_check = time.monotonic() + 10
+            try:
+                req2 = urllib.request.Request(health_url, headers=headers)
+                with urllib.request.urlopen(req2, timeout=30) as r:
+                    last_health = json.loads(r.read())
+                workers = last_health.get("workers", {})
+                if (workers.get("ready", 0) > 0
+                        or workers.get("running", 0) > 0
+                        or workers.get("idle", 0) > 0):
+                    saw_progress = True
+                # Per-tick stuck signals: explicit unhealthy / throttled
+                if workers.get("unhealthy", 0) > 0:
+                    raise StuckWorkerError(
+                        f"worker reported unhealthy after "
+                        f"{int(time.monotonic() - submit_t0)}s "
+                        f"(health={last_health})"
+                    )
+            except urllib.error.URLError as e:
+                print(f"[deploy] health probe transient error: {e}",
+                      file=sys.stderr)
+
+        elapsed = time.monotonic() - submit_t0
+        if elapsed >= stuck_threshold_s and not saw_progress:
+            raise StuckWorkerError(
+                f"job {job_id} stuck — {int(elapsed)}s elapsed and no "
+                f"worker has reached ready/running/idle. Last health: "
+                f"{last_health}. This pattern usually means RunPod placed "
+                f"the worker on a degraded host where the image pull "
+                f"can't complete; recreating the endpoint will spawn on "
+                f"a different host."
+            )
         time.sleep(0.5)
     raise TimeoutError(f"job {job_id} did not complete within {timeout_s}s")
 
@@ -423,32 +492,46 @@ def deploy_endpoint(rp: RunPodClient, args: argparse.Namespace,
 
 def cold_start_with_retry(rp: RunPodClient, args: argparse.Namespace,
                           auth_id: str | None, gpu_pool: str,
-                          endpoint_id: str, api_key: str,
-                          payload: dict) -> tuple[dict, str]:
-    """Run the cold-start job with bounded retries. On TimeoutError —
-    typically caused by a worker stuck in `initializing` because RunPod
-    placed it on a degraded host or the GPU pool is throttling — tear
-    down the endpoint and recreate to force a fresh worker spawn on
-    a different host. Returns (cold_status, endpoint_id) where
-    endpoint_id may have changed if a retry recreated the endpoint."""
+                          endpoint_box: list, api_key: str,
+                          payload: dict) -> dict:
+    """Run the cold-start job with bounded retries. On TimeoutError or
+    StuckWorkerError, tear down + recreate to force a fresh worker
+    spawn on a different RunPod host.
+
+    `endpoint_box` is a 1-element list so this function can mutate
+    the caller's view of the current endpoint id even when raising —
+    otherwise a failure mid-retry would orphan the new endpoint."""
     last_exc: Exception | None = None
     for attempt in range(args.cold_start_retries + 1):
         attempt_label = f"attempt {attempt + 1}/{args.cold_start_retries + 1}"
         print(f"\n[deploy] === COLD START === ({attempt_label}, "
-              f"timeout {args.cold_start_timeout}s)", file=sys.stderr)
+              f"timeout {args.cold_start_timeout}s, "
+              f"stuck-detection at {args.cold_start_stuck_threshold}s)",
+              file=sys.stderr)
         try:
-            cold = submit_job(endpoint_id, api_key, payload,
-                              timeout_s=args.cold_start_timeout)
-            return cold, endpoint_id
-        except TimeoutError as e:
+            cold = submit_job(
+                endpoint_box[0], api_key, payload,
+                timeout_s=args.cold_start_timeout,
+                stuck_threshold_s=args.cold_start_stuck_threshold,
+            )
+            return cold
+        except (TimeoutError, StuckWorkerError) as e:
             last_exc = e
-            print(f"[deploy] cold-start timeout: {e}", file=sys.stderr)
+            label = "stuck worker" if isinstance(e, StuckWorkerError) else "timeout"
+            print(f"[deploy] cold-start {label}: {e}", file=sys.stderr)
             if attempt >= args.cold_start_retries:
                 break
-            print(f"[deploy] tearing down stuck endpoint {endpoint_id} "
-                  f"and redeploying for retry...", file=sys.stderr)
-            rp.delete_endpoint(endpoint_id)
-            endpoint_id = deploy_endpoint(rp, args, auth_id, gpu_pool)
+            print(f"[deploy] tearing down endpoint {endpoint_box[0]} "
+                  f"and redeploying on a different RunPod host...",
+                  file=sys.stderr)
+            rp.delete_endpoint(endpoint_box[0])
+            # Mutate the caller's view BEFORE we know the new deploy
+            # succeeded — if deploy_endpoint raises we want the
+            # finally block to clean up the (already-deleted) old
+            # endpoint, which is harmless. If deploy_endpoint
+            # succeeds, the box now holds the new id for the next
+            # iteration AND for the caller's cleanup path.
+            endpoint_box[0] = deploy_endpoint(rp, args, auth_id, gpu_pool)
 
     raise RuntimeError(
         f"cold start did not complete after {args.cold_start_retries + 1} "
@@ -487,17 +570,21 @@ def main() -> int:
                    help="container disk allocation")
     p.add_argument("--warmup-jobs", type=int, default=5,
                    help="number of warm-state jobs to time after the cold one")
-    p.add_argument("--cold-start-timeout", type=int, default=300,
-                   help="seconds to wait for the cold-start job before declaring "
-                        "the worker stuck. Real cold starts on RTX 4090 land at "
-                        "~50 s; 300 s is ~6x headroom. Anything past this is "
-                        "almost certainly a stuck `initializing` worker.")
-    p.add_argument("--cold-start-retries", type=int, default=2,
-                   help="if the cold-start job times out, tear down the endpoint "
-                        "and recreate to force a fresh worker spawn on a "
-                        "different RunPod host, then retry. This is the "
-                        "documented workaround for the occasional 'worker stuck "
-                        "in initializing' state we've hit. 0 disables retries.")
+    p.add_argument("--cold-start-timeout", type=int, default=600,
+                   help="absolute backstop: seconds to wait for the cold-start "
+                        "job. The cuda flavor's image is ~5 GB (cuDNN+cuBLAS+"
+                        "cuRAND+cuFFT+cuSparse+cuSolver+nvrtc); pull on RunPod "
+                        "lands at ~3-5 min. Boot-error response itself takes "
+                        "~3 min from queue insert, so 600 s gives headroom.")
+    p.add_argument("--cold-start-stuck-threshold", type=int, default=360,
+                   help="seconds after which, if no worker has reached "
+                        "ready/running/idle, treat as stuck and trigger an "
+                        "early teardown+recreate. Should be > legitimate "
+                        "image-pull time but well under the absolute timeout.")
+    p.add_argument("--cold-start-retries", type=int, default=4,
+                   help="number of additional cold-start attempts after the "
+                        "first. With 240 s timeout + 150 s stuck threshold, "
+                        "5 total attempts ≈ 12 min worst-case before giving up.")
     p.add_argument("--keep-endpoint", action="store_true",
                    help="leave the endpoint running after the smoke test. "
                         "Default is to delete it (and template) so a smoke "
@@ -543,7 +630,13 @@ def main() -> int:
     # or unhandled exception during the smoke test still cleans up
     # the endpoint — leaving an idle GPU worker billing in the
     # background is the worst failure mode of this script.
-    endpoint_id = deploy_endpoint(rp, args, auth_id, gpu_pool)
+    #
+    # endpoint_id is wrapped in a 1-element list so cold_start_with_retry
+    # can mutate it from the inside on internal recreate. Without the
+    # mutation, an exception inside the retry loop would leave us
+    # cleaning up the OLD endpoint id and orphaning the new one we
+    # spawned — silent billing leak.
+    endpoint_box = [deploy_endpoint(rp, args, auth_id, gpu_pool)]
 
     payload = {
         "input": {
@@ -554,9 +647,10 @@ def main() -> int:
 
     summary: dict | None = None
     try:
-        cold, endpoint_id = cold_start_with_retry(
-            rp, args, auth_id, gpu_pool, endpoint_id, api_key, payload,
+        cold = cold_start_with_retry(
+            rp, args, auth_id, gpu_pool, endpoint_box, api_key, payload,
         )
+        endpoint_id = endpoint_box[0]
         if cold["status"] != "COMPLETED":
             print(f"[deploy] cold-start job failed: {json.dumps(cold, indent=2)}",
                   file=sys.stderr)
@@ -573,11 +667,22 @@ def main() -> int:
         # this in its response payload.
         diag = (cold.get("output") or {}).get("_diagnostics")
         if diag:
-            print(f"  active EPs: {diag.get('providers')}", file=sys.stderr)
-            if "CUDAExecutionProvider" not in (diag.get("providers") or []):
-                print("  WARNING: CUDA EP did NOT load — workload ran on "
-                      "CPU. Likely libcudnn/libcublas/libcudart missing on "
-                      "the worker.", file=sys.stderr)
+            providers = diag.get("providers") or []
+            print(f"  active EPs: {providers}", file=sys.stderr)
+            # Warn only on a real silent CPU degradation: the worker
+            # advertised a GPU image (anything other than the cpu flavor)
+            # but ended up running on CPUExecutionProvider only. Any of
+            # CUDAExecutionProvider / TensorrtDirect is a valid GPU
+            # path — TRT-direct is the trt flavor's signal that the
+            # engine deserialized and is executing on the GPU.
+            gpu_providers = {"CUDAExecutionProvider", "TensorrtDirect"}
+            on_gpu = any(p in gpu_providers for p in providers)
+            if providers and not on_gpu:
+                print("  WARNING: image did NOT activate a GPU provider — "
+                      "workload ran on CPU. Likely cause: missing "
+                      "libcudnn / libcublas / libcudart, or libnvinfer "
+                      "ABI mismatch (engine vs runtime TRT version).",
+                      file=sys.stderr)
 
         print(f"\n[deploy] === WARM x{args.warmup_jobs} === (worker stays alive)",
               file=sys.stderr)

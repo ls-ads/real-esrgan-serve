@@ -1,0 +1,116 @@
+# real-esrgan-serve runtime image — TensorRT flavor.
+#
+# Engine-only execution path. Uses TensorRT's Python bindings
+# directly (NOT through ONNX Runtime) to deserialize a pre-built
+# .engine file produced by `make remote-build-engine`, allocate I/O
+# on the GPU, and execute. No ONNX in the request path — the .onnx
+# is fetched and consumed once at engine-compile time, not at
+# inference time.
+#
+# Why a separate flavor: TensorRT's python3-libnvinfer + libnvinfer
+# runtime + plugin libs add ~1.5 GB on top of cuDNN. Users who only
+# need ORT CUDA EP shouldn't pay that cost. Users who need engine
+# execution get a focused image without the ORT bloat (~600 MB
+# saved by dropping the onnxruntime-gpu wheel).
+#
+# Sizing breakdown (approximate, ubuntu22.04 + cuda 12.4 base):
+#   nvidia/cuda:base            ~150 MB
+#   python3 + pip               ~ 80 MB
+#   libcudnn9-cuda-12           ~  1 GB    (TRT EP needs cuDNN)
+#   libnvinfer10 + plugin       ~700 MB    (TRT runtime)
+#   python3-libnvinfer          ~ 50 MB    (TRT Python bindings)
+#   numpy + pillow + cuda-py    ~ 60 MB    (cuda-python for buffer mgmt)
+#   Go binary (CGO=0, stripped) ~  7 MB
+#   runtime/upscaler.py         < 1 MB
+#   ───────────────────────────────────
+#                       Total   ~2.0 GB
+#
+# Build (from repo root):
+#   make docker-trt
+# ─────────────────────────────────────────────────────────────────────
+
+# --- Stage 1: build the Go binary ───────────────────────────────────
+FROM golang:1.25-alpine AS gobuild
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/      ./cmd/
+COPY internal/ ./internal/
+COPY models/   ./models/
+# Mirror `make prep-embed`: see Dockerfile.cuda for the rationale.
+RUN cp models/MANIFEST.json internal/modelfetch/manifest.json
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+        -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/real-esrgan-serve \
+        ./cmd/real-esrgan-serve
+
+# --- Stage 2: runtime ───────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+
+# cuDNN 9 + the TensorRT runtime libraries.
+#
+# TRT VERSION PIN — DO NOT REMOVE WITHOUT THINKING.
+# Engines are tied to the (TRT major.minor, CUDA major.minor) they were
+# built against; deserializing on a different combination crashes with
+# SIGSEGV (no clean error from TRT, just the worker dying mid-boot —
+# we hit this exact failure on the first TRT deploy attempt).
+#
+# Our base is cuda:12.4.1 and our build pod is also CUDA 12.4. The
+# latest libnvinfer10 NVIDIA ships for CUDA 12.4 specifically is
+# 10.1.0.27 (apt-cache madison libnvinfer10 confirms; newer TRT
+# releases are only built against CUDA 12.5+ or 13.x). Both sides
+# pinned to that version: pip install tensorrt==10.1.0 on the build
+# pod (see build/remote_build.py) AND apt-pinned here.
+#
+# python3-libnvinfer pulls in the TRT Python bindings + (transitively)
+# libnvinfer10 + libnvinfer-plugin10 — the runtime libraries TRT needs
+# at deserialize + execute. We deliberately do NOT install the
+# `tensorrt-libs` meta-package (~5 GB) because that includes the
+# builder + parser libraries we don't use at inference time.
+ARG TRT_VERSION=10.1.0.27-1+cuda12.4
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        ca-certificates \
+        libcudnn9-cuda-12 \
+        libnvinfer10=${TRT_VERSION} \
+        libnvinfer-plugin10=${TRT_VERSION} \
+        libnvinfer-vc-plugin10=${TRT_VERSION} \
+        libnvonnxparsers10=${TRT_VERSION} \
+        python3-libnvinfer=${TRT_VERSION} \
+    && apt-mark hold libnvinfer10 libnvinfer-plugin10 libnvinfer-vc-plugin10 \
+                     libnvonnxparsers10 python3-libnvinfer \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+
+# Pillow + numpy for image I/O. cuda-python is NVIDIA's official
+# CUDA driver-level binding for buffer alloc + memcpy (we need this
+# because TRT execution allocates device memory directly, no ORT
+# session abstraction). --no-deps avoids the ~600 MB ORT wheel
+# (this image doesn't run ONNX at all, so ORT is dead weight).
+RUN pip3 install --no-cache-dir --no-deps \
+        numpy==1.26.4 \
+        Pillow==10.4.0 \
+        cuda-python==12.6.0 \
+    && rm -rf /root/.cache /tmp/*
+
+# Late-arriving artefacts (small, change every build) ────────────────
+COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
+COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
+RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
+
+# Ship licensing notices alongside the binary (Apache 2.0 §4(d)).
+COPY LICENSE                       /usr/share/doc/real-esrgan-serve/LICENSE
+COPY NOTICE.md                     /usr/share/doc/real-esrgan-serve/NOTICE.md
+COPY third-party-licenses/         /usr/share/doc/real-esrgan-serve/third-party-licenses/
+
+ENV XDG_CACHE_HOME=/var/cache \
+    REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py \
+    REAL_ESRGAN_FLAVOR=trt \
+    REAL_ESRGAN_PROVIDER=trt
+
+ENTRYPOINT ["real-esrgan-serve"]
+CMD ["--help"]

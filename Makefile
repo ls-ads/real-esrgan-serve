@@ -1,5 +1,9 @@
-.PHONY: build clean test docker docker-runpod fmt vet prep-embed \
-        artifacts manifest manifest-check docker-push deploy-runpod e2e-runpod
+.PHONY: build clean test fmt vet prep-embed \
+        docker-cpu docker-cuda docker-trt \
+        docker-runpod-cpu docker-runpod-cuda docker-runpod-trt \
+        docker-push-cpu docker-push-cuda docker-push-trt \
+        artifacts artifacts-onnx artifacts-engine manifest manifest-check \
+        remote-build-engine deploy-runpod e2e-runpod
 BIN_DIR ?= bin
 VERSION ?= dev
 
@@ -35,42 +39,114 @@ fmt:
 vet:
 	go vet ./...
 
-# Base runtime image — license-clean (CUDA EULA only, no nvcr.io/...)
-docker:
-	docker build --build-arg VERSION=$(VERSION) -t real-esrgan-serve:$(VERSION) .
+# Three image flavors, one per execution mode. Each is a complete
+# image that consumers pull as `real-esrgan-serve:<flavor>-VERSION`.
+# Pick the flavor that matches the workload's needs:
+#
+#   cpu  — smallest (~280 MB). ORT CPU wheel, no GPU libs at all.
+#   cuda — medium (~2.4 GB). ORT CUDA EP via cuDNN 9. Loads .onnx.
+#   trt  — TRT runtime (~2 GB). TensorRT Python directly, .engine
+#          files only. No ORT.
+#
+# Each flavor has a corresponding `docker-runpod-<flavor>` target
+# that produces the RunPod-specific image layered on top of it.
 
-# RunPod serverless image — layers on top of the base
-docker-runpod: docker
+docker-cpu:
+	docker build --build-arg VERSION=$(VERSION) \
+		-f Dockerfile.cpu \
+		-t real-esrgan-serve:cpu-$(VERSION) .
+
+docker-cuda:
+	docker build --build-arg VERSION=$(VERSION) \
+		-f Dockerfile.cuda \
+		-t real-esrgan-serve:cuda-$(VERSION) .
+
+docker-trt:
+	docker build --build-arg VERSION=$(VERSION) \
+		-f Dockerfile.trt \
+		-t real-esrgan-serve:trt-$(VERSION) .
+
+# RunPod serverless images — one per flavor, layered on top of the
+# matching base. Set FLAVOR=cpu|cuda|trt at the command line, or use
+# the convenience targets below.
+docker-runpod-cpu: docker-cpu
 	docker build \
-		--build-arg BASE_TAG=$(VERSION) \
+		--build-arg BASE_TAG=cpu-$(VERSION) \
 		-f providers/runpod/Dockerfile \
-		-t real-esrgan-serve:runpod-$(VERSION) \
+		-t real-esrgan-serve:runpod-cpu-$(VERSION) \
+		.
+
+docker-runpod-cuda: docker-cuda
+	docker build \
+		--build-arg BASE_TAG=cuda-$(VERSION) \
+		-f providers/runpod/Dockerfile \
+		-t real-esrgan-serve:runpod-cuda-$(VERSION) \
+		.
+
+docker-runpod-trt: docker-trt
+	docker build \
+		--build-arg BASE_TAG=trt-$(VERSION) \
+		-f providers/runpod/Dockerfile \
+		-t real-esrgan-serve:runpod-trt-$(VERSION) \
 		.
 
 # ─── Artefact pipeline (build/ — produces release artefacts) ─────────
-# One-stage now: export the .pth → .onnx in a deps-frozen container.
-# Runs anywhere with Docker; doesn't require a GPU. CI runs this on
-# tag push (.github/workflows/release.yml).
-#
-# `make artifacts` builds the export image and runs it, dropping the
-# resulting .onnx files into build/dist/. The base+runpod images COPY
-# from build/dist/ at docker-build time.
-#
-# Stage A's basicsr stack is brittle on modern Python — see
-# build/Dockerfile.export's header for the dependency-archeology
-# notes. Do NOT replace the docker-run with a local
-# `python3 build/export_onnx.py` invocation unless you're prepared
-# to wrestle the deps into a working set yourself.
-artifacts:
+# Stage A (artifacts-onnx) runs anywhere; produces .onnx weights.
+# Stage B (artifacts-engine) requires the target GPU; produces a
+# .engine pinned to that GPU's SM arch + the host's TRT version.
+# Run them ad-hoc to add a new GPU class without cutting a release;
+# CI runs the full matrix on tag push (.github/workflows/release.yml).
+
+artifacts: artifacts-onnx artifacts-engine
+
+# Stage A: ONNX export. Containerised because basicsr is unmaintained
+# and modern PyPI breaks it — see build/Dockerfile.export's header
+# for the full reasoning. Do NOT replace this with a local
+# `python3 build/export_onnx.py` invocation unless you've already
+# wrestled the deps into a working set yourself.
+artifacts-onnx:
 	docker build -f build/Dockerfile.export -t real-esrgan-serve-export build/
 	mkdir -p build/dist
 	docker run --rm -v $(PWD)/build/dist:/output real-esrgan-serve-export
+
+# Stage B: TensorRT engine compile. Requires a real GPU with TRT
+# Python bindings installed. `--auto-detect-gpu` reads nvidia-smi to
+# bake the GPU class + SM arch into the output filename.
+artifacts-engine:
+	cd build && python3 compile_engine.py \
+		--onnx dist/realesrgan-x4plus_fp16.onnx \
+		--auto-detect-gpu
 
 manifest:
 	python3 build/update_manifest.py
 
 manifest-check:
 	python3 build/update_manifest.py --check
+
+# ─── Remote engine compile via RunPod ───────────────────────────────
+# Spins up a temp RunPod GPU pod, runs `make artifacts-engine` (the
+# same target as the local one above) over SSH on the pod, pulls the
+# resulting .engine back, terminates the pod. The remote script
+# tarballs your working tree, so uncommitted changes to scripts or
+# Make targets take effect on the remote run.
+#
+# This means: if remote build works, local build is guaranteed to
+# work — same code, just running on a different host.
+#
+# Set GPU_CLASS to one of: rtx-4090, l40s, a100-40, h100, ...
+#
+# Auth: $RUNPOD_API_KEY in env. Maintainer convenience:
+#   prefix with `build/.with-iosuite-key` to source from
+#   ~/Projects/iosuite.io/.env without echoing the value.
+remote-build-engine:
+	@if [ -z "$$RUNPOD_API_KEY" ]; then \
+		echo "RUNPOD_API_KEY not set. Either:"; \
+		echo "  export RUNPOD_API_KEY=..."; \
+		echo "or use the maintainer wrapper:"; \
+		echo "  build/.with-iosuite-key make remote-build-engine GPU_CLASS=$(GPU_CLASS)"; \
+		exit 1; \
+	fi
+	python3 build/remote_build.py --gpu-class $(GPU_CLASS)
 
 # ─── RunPod serverless deploy + cold-start smoke test ───────────────
 # Deploys the runpod image to a RunPod serverless endpoint, runs a
@@ -89,15 +165,26 @@ manifest-check:
 # Auth: $RUNPOD_API_KEY in env. Maintainer convenience:
 #   prefix with `build/.with-iosuite-key` to source from
 #   ~/Projects/iosuite.io/.env without echoing the value.
-IMAGE         ?= ghcr.io/ls-ads/real-esrgan-serve:runpod-test
+IMAGE         ?= ghcr.io/ls-ads/real-esrgan-serve:runpod-cuda-test
 GPU_CLASS     ?= rtx-4090
 ENDPOINT_NAME ?= real-esrgan-serve-test
 WARMUP_JOBS   ?= 5
 
-docker-push: docker docker-runpod
-	docker tag real-esrgan-serve:runpod-$(VERSION) ghcr.io/ls-ads/real-esrgan-serve:runpod-$(VERSION)
-	docker push ghcr.io/ls-ads/real-esrgan-serve:runpod-$(VERSION)
-	@echo "pushed: ghcr.io/ls-ads/real-esrgan-serve:runpod-$(VERSION)"
+# Three push targets, one per flavor.
+docker-push-cpu: docker-runpod-cpu
+	docker tag real-esrgan-serve:runpod-cpu-$(VERSION) ghcr.io/ls-ads/real-esrgan-serve:runpod-cpu-$(VERSION)
+	docker push ghcr.io/ls-ads/real-esrgan-serve:runpod-cpu-$(VERSION)
+	@echo "pushed: ghcr.io/ls-ads/real-esrgan-serve:runpod-cpu-$(VERSION)"
+
+docker-push-cuda: docker-runpod-cuda
+	docker tag real-esrgan-serve:runpod-cuda-$(VERSION) ghcr.io/ls-ads/real-esrgan-serve:runpod-cuda-$(VERSION)
+	docker push ghcr.io/ls-ads/real-esrgan-serve:runpod-cuda-$(VERSION)
+	@echo "pushed: ghcr.io/ls-ads/real-esrgan-serve:runpod-cuda-$(VERSION)"
+
+docker-push-trt: docker-runpod-trt
+	docker tag real-esrgan-serve:runpod-trt-$(VERSION) ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-$(VERSION)
+	docker push ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-$(VERSION)
+	@echo "pushed: ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-$(VERSION)"
 
 deploy-runpod:
 	@if [ -z "$$RUNPOD_API_KEY" ]; then \

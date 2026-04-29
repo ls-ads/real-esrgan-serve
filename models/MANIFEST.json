@@ -6,7 +6,7 @@
       "name": "realesrgan-x4plus",
       "variant": "fp16",
       "filename": "realesrgan-x4plus_fp16.onnx",
-      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0/realesrgan-x4plus_fp16.onnx",
+      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0-rc1/realesrgan-x4plus_fp16.onnx",
       "sha256": "e662cfd8c4280d1247b0bf248a09b9a410b5ee231e1c1b24374f03546d53ae6b",
       "bytes": 33632098,
       "license": "BSD-3-Clause (Real-ESRGAN upstream)",
@@ -17,12 +17,26 @@
       "name": "realesrgan-x4plus",
       "variant": "fp32",
       "filename": "realesrgan-x4plus_fp32.onnx",
-      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0/realesrgan-x4plus_fp32.onnx",
+      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0-rc1/realesrgan-x4plus_fp32.onnx",
       "sha256": "6b79c73942273a57ec43a1f28f28c9fe0eefbaf55aa3a3e0d58883b05ed66297",
       "bytes": 66953348,
       "license": "BSD-3-Clause (Real-ESRGAN upstream)",
       "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
       "notes": "Higher precision baseline; slower on most GPUs."
+    },
+    {
+      "name": "realesrgan-x4plus",
+      "variant": "engine",
+      "gpu_class": "l40s",
+      "sm_arch": "sm89",
+      "trt_version": "10.1",
+      "filename": "realesrgan-x4plus-l40s-sm89-trt10.1_fp16.engine",
+      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0-rc1/realesrgan-x4plus-l40s-sm89-trt10.1_fp16.engine",
+      "sha256": "52a0265cb180c998cdd089853bed5178a01b1343dfc554c1d7c8c6da47e980a3",
+      "bytes": 36954788,
+      "license": "BSD-3-Clause (Real-ESRGAN upstream)",
+      "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
+      "notes": "TensorRT 10.1 engine for sm89 (works on any sm89 GPU: RTX 4090, L4, L40S). Built on L40S because RTX 4090 secure-cloud capacity for the required driver tier was exhausted at compile time."
     }
   ]
 }

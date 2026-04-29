@@ -56,6 +56,9 @@ type Manifest struct {
 type Model struct {
 	Name       string `json:"name"`
 	Variant    string `json:"variant"`
+	GPUClass   string `json:"gpu_class,omitempty"`
+	SMArch     string `json:"sm_arch,omitempty"`
+	TRTVersion string `json:"trt_version,omitempty"`
 	Filename   string `json:"filename"`
 	URL        string `json:"url"`
 	SHA256     string `json:"sha256"`
@@ -68,6 +71,8 @@ type Model struct {
 type opts struct {
 	name     string
 	variant  string
+	gpuClass string
+	smArch   string
 	dest     string
 	manifest string
 	noVerify bool
@@ -88,6 +93,11 @@ and caches under $XDG_CACHE_HOME/real-esrgan-serve/models (or
 Variants:
   --variant fp16    smaller, faster; default
   --variant fp32    higher precision; baseline
+  --variant engine  TensorRT-compiled engine for a specific GPU. Pass
+                    one of --gpu-class or --sm-arch to disambiguate.
+                    --sm-arch matches more reliably (an RTX 4090 and
+                    an L40S share sm89 and the same engine works on
+                    both); --gpu-class is the human-friendly form.
 
 If a model file is already present and matches the manifest hash,
 fetch-model returns immediately without re-downloading.`,
@@ -98,7 +108,9 @@ fetch-model returns immediately without re-downloading.`,
 
 	f := cmd.Flags()
 	f.StringVar(&o.name, "name", "realesrgan-x4plus", "Model name as listed in MANIFEST.json")
-	f.StringVar(&o.variant, "variant", "fp16", "Variant: fp16 | fp32")
+	f.StringVar(&o.variant, "variant", "fp16", "Variant: fp16 | fp32 | engine")
+	f.StringVar(&o.gpuClass, "gpu-class", "", "GPU class for engine variant (e.g. rtx-4090, a40)")
+	f.StringVar(&o.smArch, "sm-arch", "", "SM compute capability for engine variant (e.g. sm89). Preferred over --gpu-class because one engine works for every GPU sharing the SM.")
 	f.StringVar(&o.dest, "dest", "", "Override cache destination (default: XDG cache dir)")
 	f.StringVar(&o.manifest, "manifest", "", "Override manifest path (default: built-in / repo-relative)")
 	f.BoolVar(&o.noVerify, "no-verify", false, "Skip SHA-256 verification — DANGEROUS, dev only")
@@ -113,7 +125,7 @@ func run(o *opts) error {
 		return fmt.Errorf("manifest: %w", err)
 	}
 
-	entry, err := mf.Find(o.name, o.variant)
+	entry, err := mf.Find(o.name, o.variant, o.gpuClass, o.smArch)
 	if err != nil {
 		return err
 	}
@@ -220,16 +232,39 @@ func loadManifest(override string) (*Manifest, error) {
 	return &m, nil
 }
 
-// Find picks the manifest entry matching name+variant.
-func (m *Manifest) Find(name, variant string) (*Model, error) {
+// Find picks the manifest entry matching name+variant. For the
+// "engine" variant, gpuClass OR smArch must match too. smArch is
+// the preferred discriminator because multiple GPUs share an SM
+// (RTX 4090 + L40S + L4 are all sm89 → one engine works for all).
+func (m *Manifest) Find(name, variant, gpuClass, smArch string) (*Model, error) {
 	for i := range m.Models {
 		e := &m.Models[i]
-		if e.Name == name && e.Variant == variant {
-			return e, nil
+		if e.Name != name || e.Variant != variant {
+			continue
+		}
+		if variant == "engine" {
+			if smArch == "" && gpuClass == "" {
+				return nil, fmt.Errorf("--sm-arch or --gpu-class required when --variant engine")
+			}
+			if smArch != "" && e.SMArch != smArch {
+				continue
+			}
+			if smArch == "" && gpuClass != "" && e.GPUClass != gpuClass {
+				continue
+			}
+		}
+		return e, nil
+	}
+	hint := ""
+	if variant == "engine" {
+		if smArch != "" {
+			hint = fmt.Sprintf(" (sm-arch=%s)", smArch)
+		} else if gpuClass != "" {
+			hint = fmt.Sprintf(" (gpu-class=%s)", gpuClass)
 		}
 	}
-	return nil, fmt.Errorf("no manifest entry for name=%s variant=%s — available: %s",
-		name, variant, m.summarise())
+	return nil, fmt.Errorf("no manifest entry for name=%s variant=%s%s — available: %s",
+		name, variant, hint, m.summarise())
 }
 
 func (m *Manifest) summarise() string {
@@ -241,6 +276,13 @@ func (m *Manifest) summarise() string {
 		sb.WriteString(e.Name)
 		sb.WriteString("/")
 		sb.WriteString(e.Variant)
+		if e.SMArch != "" {
+			sb.WriteString("@")
+			sb.WriteString(e.SMArch)
+		} else if e.GPUClass != "" {
+			sb.WriteString("@")
+			sb.WriteString(e.GPUClass)
+		}
 	}
 	return sb.String()
 }

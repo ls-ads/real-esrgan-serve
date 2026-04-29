@@ -1,24 +1,19 @@
 # providers/runpod/Dockerfile — RunPod serverless image for
 # real-esrgan-serve. Layers on top of the base runtime image, adds
-# RunPod's Python SDK, the platform-specific handler, and bakes in
-# the .onnx model so cold starts don't pay network cost.
+# RunPod's Python SDK and the platform-specific handler.
 #
-# Cold start is the bottleneck on RunPod serverless. The image-pull
-# itself is the dominant cost (mitigated by the slim base — see the
-# parent Dockerfile). First-request latency is small because
-# onnxruntime's CUDA EP loads the .onnx in <1 s.
+# Model artefacts (.onnx, .engine) are NOT baked in. handler.py runs
+# `real-esrgan-serve fetch-model` at module-import time (before the
+# runpod SDK starts polling the job queue), downloads the right
+# variant for the requested EP and the host GPU's SM arch, and
+# caches under $XDG_CACHE_HOME/real-esrgan-serve/models for the
+# rest of the worker's lifetime. Trade-off: +5–30 s on first cold
+# start in exchange for an image that's portable across providers,
+# decoupled from model version, and lets one image serve cpu/cuda/
+# trt workloads via REAL_ESRGAN_PROVIDER env var.
 #
 # Build (from repo root):
 #   make docker docker-runpod
-# Layout produced:
-#   /workspace/realesrgan-x4plus_fp16.onnx
-#
-# Once an upstream release exists at
-# https://github.com/ls-ads/real-esrgan-serve/releases/download/v*/...
-# this Dockerfile can switch to `real-esrgan-serve fetch-model`
-# instead of COPY. For the initial bring-up we use COPY from the
-# locally-built build/dist/ — see build/README.md for how to
-# produce those.
 ARG BASE_TAG=dev
 FROM real-esrgan-serve:${BASE_TAG}
 
@@ -29,13 +24,6 @@ RUN pip3 install --no-cache-dir \
         "pydantic==2.9.2" \
         "requests==2.32.3" \
     && rm -rf /root/.cache /tmp/*
-
-# Bake the .onnx model into the image. Tiny relative to ORT's wheel
-# (~33 MB FP16), and saves the worker a network fetch on first
-# request. handler.py reads from $REAL_ESRGAN_MODEL or
-# /workspace/realesrgan-x4plus_fp16.onnx, falling back to
-# `real-esrgan-serve fetch-model` if neither resolves.
-COPY build/dist/realesrgan-x4plus_fp16.onnx /workspace/realesrgan-x4plus_fp16.onnx
 
 WORKDIR /app
 COPY providers/runpod/handler.py /app/handler.py

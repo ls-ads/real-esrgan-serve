@@ -58,6 +58,12 @@ RUN go mod download
 COPY cmd/      ./cmd/
 COPY internal/ ./internal/
 COPY models/   ./models/
+# Mirror `make prep-embed`: copy the canonical manifest into the
+# modelfetch package so go:embed picks it up. The disk path
+# internal/modelfetch/manifest.json is gitignored so we can't rely
+# on it being current — copying from models/MANIFEST.json here
+# (which IS tracked) keeps the embedded manifest in sync.
+RUN cp models/MANIFEST.json internal/modelfetch/manifest.json
 ARG VERSION=dev
 # CGO=0 + -s -w + trimpath = smallest, fully static, reproducible binary.
 RUN CGO_ENABLED=0 go build \
@@ -66,13 +72,25 @@ RUN CGO_ENABLED=0 go build \
         -o /out/real-esrgan-serve \
         ./cmd/real-esrgan-serve
 
-# --- Stage 2: runtime (slim) ────────────────────────────────────────
-FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+# --- Stage 2: runtime ───────────────────────────────────────────────
+# We use the `cudnn-runtime` variant rather than `:base` + hand-picked
+# CUDA-X libs. Reason: ORT 1.20's CUDAExecutionProvider plugin
+# dlopens libcudart, libcudnn, libcublas, libcublasLt, libcurand,
+# libcufft, libnvrtc, libcusparse, libcusolver at session creation,
+# and ANY missing one silently drops CUDA EP and degrades to CPU EP.
+# Picking individual `libcuda*-12-4` packages off the apt repo
+# requires getting every name right and tracking what each ORT
+# release needs — fragile and a slow iteration loop.
+#
+# `cudnn-runtime` ships the full CUDA-X runtime + cuDNN as one layer
+# maintained by NVIDIA. Image is ~5 GB (same order as picking the
+# libs by hand) but eliminates the per-lib hunt entirely.
+#
+# This image deliberately does NOT install libnvinfer / TensorRT —
+# those are reserved for the `trt` flavor.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# Minimal Python install. We drop python3-numpy and python3-pil
-# from apt (saves ~50 MB vs the previous shape) — both come in via
-# pip wheels below. apt's Pillow also links a wider set of system
-# codecs we don't use, so the pip wheel is leaner.
+# python3-numpy/pil dropped from apt; pip wheels below.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
@@ -81,15 +99,24 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
 
-# onnxruntime-gpu provides the CUDA EP we use for inference. Pillow
-# + numpy are pulled in explicitly because we dropped python3-numpy
-# /pil from apt above; --no-deps keeps the layer from picking up
-# unused GPU libs (e.g. TensorRT's ~2 GB pip wheel).
+# onnxruntime-gpu 1.20.x — required for cuDNN 9 (1.18.x linked
+# against cuDNN 8 and would fail to load on this base). Pillow +
+# numpy are pulled in explicitly because we dropped python3-numpy/pil
+# from apt above; --no-deps keeps the layer from picking up
+# unused GPU libs (we want the system-installed TRT, not pip's).
 RUN pip3 install --no-cache-dir --no-deps \
-        onnxruntime-gpu==1.18.1 \
+        onnxruntime-gpu==1.20.1 \
         numpy==1.26.4 \
         Pillow==10.4.0 \
     && rm -rf /root/.cache /tmp/*
+
+# Bake the FP16 ONNX into the image. Architecture-independent, ~32 MB
+# — small relative to the cuDNN runtime layer above. Pre-baking saves
+# one network RTT on cold start; handler short-circuits to this path
+# via REAL_ESRGAN_MODEL (set below). fetch-model is still wired up for
+# non-default variants (fp32) via the manifest URL.
+COPY build/dist/realesrgan-x4plus_fp16.onnx \
+     /var/cache/real-esrgan-serve/models/realesrgan-x4plus_fp16.onnx
 
 # Late-arriving artefacts (small, change every build) ────────────────
 COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
@@ -109,7 +136,10 @@ COPY third-party-licenses/         /usr/share/doc/real-esrgan-serve/third-party-
 # Network Volume, K8s PVC, etc.) so an out-of-image fetch survives
 # container restarts.
 ENV XDG_CACHE_HOME=/var/cache \
-    REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py
+    REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py \
+    REAL_ESRGAN_FLAVOR=cuda \
+    REAL_ESRGAN_PROVIDER=cuda \
+    REAL_ESRGAN_MODEL=/var/cache/real-esrgan-serve/models/realesrgan-x4plus_fp16.onnx
 
 ENTRYPOINT ["real-esrgan-serve"]
 CMD ["--help"]

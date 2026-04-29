@@ -1,0 +1,93 @@
+# real-esrgan-serve runtime image — CPU flavor.
+#
+# Slimmest of the three image flavors. Uses ORT's CPU-only wheel
+# (`onnxruntime`, NOT `onnxruntime-gpu`), so we don't need any
+# CUDA/cuDNN/TensorRT libraries — base is plain Ubuntu rather than
+# nvidia/cuda:base. Suitable for hosts without a GPU, or as a
+# correctness-baseline / fallback image when GPU capacity is
+# constrained.
+#
+# Sizing breakdown (approximate):
+#   ubuntu:22.04                ~ 78 MB
+#   python3 + pip               ~ 80 MB
+#   numpy + pillow (pip wheels) ~ 30 MB
+#   onnxruntime (CPU)           ~ 80 MB
+#   Go binary (CGO=0, stripped) ~  7 MB
+#   runtime/upscaler.py         < 1 MB
+#   ───────────────────────────────────
+#                       Total   ~280 MB
+#
+# Build (from repo root):
+#   make docker-cpu
+# Run (one-shot CPU upscale):
+#   docker run --rm -v $PWD/imgs:/work \
+#     real-esrgan-serve:cpu-dev upscale -i /work/in.jpg -o /work/out.jpg \
+#     --model realesrgan-x4plus
+# ─────────────────────────────────────────────────────────────────────
+
+# --- Stage 1: build the Go binary ───────────────────────────────────
+FROM golang:1.25-alpine AS gobuild
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/      ./cmd/
+COPY internal/ ./internal/
+COPY models/   ./models/
+# Mirror `make prep-embed`: see Dockerfile.cuda for the rationale.
+RUN cp models/MANIFEST.json internal/modelfetch/manifest.json
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+        -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/real-esrgan-serve \
+        ./cmd/real-esrgan-serve
+
+# --- Stage 2: runtime ───────────────────────────────────────────────
+FROM ubuntu:22.04
+
+# Minimal Python install. We drop python3-numpy and python3-pil
+# from apt — both come in via pip wheels below for a leaner layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+
+# CPU-only ORT wheel. NOT onnxruntime-gpu — the gpu wheel is ~600 MB
+# bigger and the extra GPU EP plugins it ships are useless here.
+# --no-deps because we install numpy + Pillow explicitly below; with
+# --no-deps the GPU wheel can't accidentally drag in CUDA stubs.
+RUN pip3 install --no-cache-dir --no-deps \
+        onnxruntime==1.20.1 \
+        numpy==1.26.4 \
+        Pillow==10.4.0 \
+    && rm -rf /root/.cache /tmp/*
+
+# Bake the FP16 ONNX into the image. Architecture-independent, ~32 MB.
+# Pre-baking trades image size for one fewer network RTT on cold start
+# — meaningful on serverless flavors where the worker fetches at boot
+# before accepting jobs. The handler short-circuits to this path via
+# REAL_ESRGAN_MODEL below; fetch-model still works for non-default
+# variants (fp32) by hitting the manifest URL.
+COPY build/dist/realesrgan-x4plus_fp16.onnx \
+     /var/cache/real-esrgan-serve/models/realesrgan-x4plus_fp16.onnx
+
+# Late-arriving artefacts (small, change every build) ────────────────
+COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
+COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
+RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
+
+# Ship licensing notices alongside the binary (Apache 2.0 §4(d)).
+COPY LICENSE                       /usr/share/doc/real-esrgan-serve/LICENSE
+COPY NOTICE.md                     /usr/share/doc/real-esrgan-serve/NOTICE.md
+COPY third-party-licenses/         /usr/share/doc/real-esrgan-serve/third-party-licenses/
+
+ENV XDG_CACHE_HOME=/var/cache \
+    REAL_ESRGAN_RUNTIME=/usr/share/real-esrgan-serve/runtime/upscaler.py \
+    REAL_ESRGAN_FLAVOR=cpu \
+    REAL_ESRGAN_MODEL=/var/cache/real-esrgan-serve/models/realesrgan-x4plus_fp16.onnx
+
+ENTRYPOINT ["real-esrgan-serve"]
+CMD ["--help"]
