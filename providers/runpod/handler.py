@@ -225,7 +225,13 @@ def _resolve_model_path() -> Path:
         log.info(f"PROVIDER=trt + sm={sm}: fetching matching engine")
         _fetch("--name", MODEL_NAME, "--variant", "engine",
                "--sm-arch", sm, "--dest", str(cache_dir))
-        engines = sorted(cache_dir.glob(f"*{sm}*.engine"))
+        # Engine glob picks the single-mode artefact (no _batched
+        # suffix). The batched-mode variant is fetched separately by
+        # _resolve_batched_engine_path; that's a performance
+        # optimization, not a correctness requirement, so a missing
+        # batched artefact doesn't fail the boot.
+        engines = sorted(p for p in cache_dir.glob(f"*{sm}*.engine")
+                         if "_batched" not in p.name)
         if not engines:
             raise RuntimeError(
                 f"fetch-model succeeded for sm={sm} but no matching .engine "
@@ -248,6 +254,43 @@ def _resolve_model_path() -> Path:
     return onnx
 
 
+def _resolve_batched_engine_path() -> Optional[Path]:
+    """Try to fetch the batched-mode engine for this host's SM arch.
+    Returns the local Path on success, None if any step fails — a
+    missing batched engine is NOT a boot error; the worker just
+    iterates per-image instead. Pairs with the single-mode engine
+    from `_resolve_model_path`."""
+    if PROVIDER != "trt":
+        return None
+    explicit = os.environ.get("REAL_ESRGAN_MODEL_BATCHED")
+    if explicit and Path(explicit).exists():
+        log.info(f"using REAL_ESRGAN_MODEL_BATCHED={explicit}")
+        return Path(explicit)
+
+    sm = _gpu_sm_arch()
+    if not sm:
+        return None
+
+    cache_dir = Path(os.environ.get("XDG_CACHE_HOME", "/var/cache")) / "real-esrgan-serve" / "models"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["real-esrgan-serve", "fetch-model",
+           "--name", MODEL_NAME, "--variant", "engine-batched",
+           "--sm-arch", sm, "--dest", str(cache_dir)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log.warn(f"no batched engine for sm={sm} (fetch-model exit "
+                 f"{proc.returncode}): {proc.stderr.strip()[:160]}")
+        return None
+    engines = sorted(p for p in cache_dir.glob(f"*{sm}*.engine")
+                     if "_batched" in p.name)
+    if not engines:
+        log.warn(f"batched fetch succeeded for sm={sm} but no _batched "
+                 f"engine under {cache_dir}")
+        return None
+    log.info(f"using pre-built batched engine: {engines[0].name}")
+    return engines[0]
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Persistent helper subprocess (warm onnxruntime session)
 # ───────────────────────────────────────────────────────────────────────
@@ -259,18 +302,22 @@ class WarmHelper:
     """
 
     def __init__(self, model: Path, gpu_id: int = 0,
-                 provider: str = "auto") -> None:
+                 provider: str = "auto",
+                 batched_model: Optional[Path] = None) -> None:
         log.info(f"Warming helper: model={model.name}, gpu={gpu_id}, "
-                 f"provider={provider}")
+                 f"provider={provider}, batched={batched_model.name if batched_model else None}")
+        cmd = [
+            PYTHON_BIN,
+            str(RUNTIME_HELPER),
+            "--serve",
+            "--model", str(model),
+            "--gpu-id", str(gpu_id),
+            "--provider", provider,
+        ]
+        if batched_model:
+            cmd += ["--batched-model", str(batched_model)]
         self._proc = subprocess.Popen(
-            [
-                PYTHON_BIN,
-                str(RUNTIME_HELPER),
-                "--serve",
-                "--model", str(model),
-                "--gpu-id", str(gpu_id),
-                "--provider", provider,
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -313,7 +360,9 @@ class WarmHelper:
         self.providers: list[str] = list(ready.get("providers") or [])
         self.requested_provider: str = ready.get("requested_provider") or ""
         self.model_name: str = ready.get("model") or ""
-        log.info(f"Helper ready (active EPs: {self.providers})")
+        self.batched_model_name: Optional[str] = ready.get("batched_model")
+        log.info(f"Helper ready (active EPs: {self.providers}, "
+                 f"batched: {self.batched_model_name})")
 
     def _read_loop(self) -> None:
         for line in self._proc.stdout:  # type: ignore[union-attr]
@@ -421,10 +470,15 @@ def _bootstrap() -> None:
     try:
         import traceback
         _model_path = _resolve_model_path()
+        # Fetch the optional batched engine alongside. Returns None on
+        # any failure (no manifest entry, network blip, sm-arch
+        # mismatch) — boot still proceeds with single-engine routing.
+        _batched_path = _resolve_batched_engine_path()
         _HELPER = WarmHelper(
             model=_model_path,
             gpu_id=int(os.environ.get("GPU_ID", "0")),
             provider=PROVIDER,
+            batched_model=_batched_path,
         )
     except BaseException as _boot_exc:  # noqa: BLE001 — really need everything
         _BOOT_ERROR = {
@@ -632,25 +686,53 @@ def _process_batch(items: list[InputPayload], default_format: str,
         _, _, w, h, _, _ = st
         groups.setdefault((w, h), []).append(idx)
 
-    # Within each shape group, dispatch one helper call per image.
-    #
-    # The intent of grouping was to call _HELPER.upscale_batch for
-    # groups of size > 1, collapsing N forward passes into one. The
-    # plumbing for that exists end-to-end — handler.WarmHelper has
-    # upscale_batch, runtime/upscaler.py has the batched JSONL
-    # protocol, TrtSession picks the right TRT optimisation profile
-    # — but the production engines today are single-profile and
-    # reject batch>1 at set_input_shape. Dual-profile engines we
-    # tried showed a 5-22× per-image regression because TRT had to
-    # pick conservative tactics that fit both profiles' memory
-    # budgets at build time. See FOLLOWUPS.md "True batched inference"
-    # for the path forward (likely two separate engines per arch).
-    #
-    # Until that's resolved we iterate within groups — same wall-time
-    # behaviour as the pre-grouping handler, but the structure is in
-    # place to swap in a single batched call once the engine can do it.
+    # Per shape group: call upscale_batch when the helper has a
+    # batched engine loaded AND the group has 2+ items, else iterate
+    # per-image on the primary engine. The helper itself does a final
+    # routing check (the batched engine's profile may not admit this
+    # shape) and falls back to per-image iteration internally — see
+    # runtime/upscaler.py:_serve_one_batch.
+    use_batched = bool(_HELPER and _HELPER.batched_model_name)
     outputs: list[Optional[dict]] = [None] * len(items)
     for shape, indices in groups.items():
+        if use_batched and len(indices) >= 2:
+            in_paths = [staged[i][0] for i in indices]
+            out_paths = [staged[i][1] for i in indices]
+            group_id = f"{job_id or 'job'}_grp_{shape[0]}x{shape[1]}"
+            t0_ms = time.monotonic() * 1000
+            try:
+                result = _HELPER.upscale_batch(in_paths, out_paths, job_id=group_id)
+                batch_ms = int(time.monotonic() * 1000 - t0_ms)
+                if result.get("event") != "done":
+                    raise RuntimeError(result.get("msg", "helper returned unexpected event"))
+                # Per-image attribution: total batch ms / N. Honest for
+                # cost analysis since per-image launch overhead is gone
+                # in the batched path.
+                per_item_ms = batch_ms // max(1, len(indices))
+                for i in indices:
+                    in_p, out_p, _, _, _, partial = staged[i]
+                    outputs[i] = _finalise_one_item(
+                        item=items[i], in_path=in_p, out_path=out_p,
+                        partial=partial, exec_ms=per_item_ms,
+                        discard_output=discard_output,
+                    )
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.error(f"group {shape} batched: {e}", request_id=job_id)
+                # Mark each item as failed and move on. We don't fall
+                # back to per-image here because a batched-call failure
+                # likely means the helper subprocess is unwell — better
+                # to surface than to mask via slower per-image retries.
+                for i in indices:
+                    errors.append({"index": i, "error": str(e)})
+                    try:
+                        staged[i][0].unlink(missing_ok=True)
+                        staged[i][1].unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+
+        # Single-engine path (no batched engine OR group size 1).
         for i in indices:
             in_p, out_p, _, _, _, partial = staged[i]
             item_id = f"{job_id or 'job'}_{shape[0]}x{shape[1]}_{i}"
@@ -668,7 +750,6 @@ def _process_batch(items: list[InputPayload], default_format: str,
             except Exception as e:  # noqa: BLE001
                 log.error(f"item {i}: {e}", request_id=job_id)
                 errors.append({"index": i, "error": str(e)})
-                # Best-effort cleanup so a failed item doesn't leak.
                 try:
                     in_p.unlink(missing_ok=True)
                     out_p.unlink(missing_ok=True)

@@ -492,41 +492,57 @@ def run_serve(args: argparse.Namespace) -> int:
     """Daemon mode: load model once, then process JSONL jobs from stdin
     until EOF. Errors on a single job emit an event but do not exit.
 
+    Optionally loads a second `--batched-model` engine alongside the
+    primary one. When both are loaded, batched JSONL frames route to
+    the batched engine and single frames route to the primary —
+    independent, single-profile engines avoid the dual-profile tactic-
+    selection regression (see feedback_dual_profile_regression memory).
+
     Two frame shapes accepted:
 
-      Single image (legacy + ergonomic):
+      Single image:
         {"id": "...", "input": "/path/to/in.jpg", "output": "/path/to/out.jpg"}
-        → emits {"event": "done", "id": "...", "output": "/path/to/out.jpg"}
+        → routes to the primary session.
+        → emits {"event": "done", "id": "...", "output": "..."}
 
       Batched (same shape across all items):
         {"id": "...",
-         "inputs":  ["in1.jpg", "in2.jpg", ...],
-         "outputs": ["out1.jpg", "out2.jpg", ...]}
+         "inputs":  [...], "outputs": [...]}
+        → routes to the batched session if --batched-model was loaded
+          AND the shape fits its profile; else falls back to the
+          primary session in iterate-per-image mode.
         → emits {"event": "done", "id": "...",
-                 "results": [{"output": "out1.jpg"}, ...],
-                 "batched": true}
-
-    The batched path stacks the per-image NCHW tensors along axis 0
-    (so all images must have the same H,W — the caller is expected
-    to group by shape before sending), runs ONE forward pass, then
-    slices the output back into per-image entries. That collapses
-    N forward passes (with their N × set_input_shape + N × launch
-    overhead) into one — the single biggest perf opportunity the
-    sweep flagged.
+                 "results": [{"output": "..."}, ...],
+                 "batched": true,
+                 "engine": "primary" | "batched"}
     """
     import numpy as np  # type: ignore[import-not-found]
 
     model = Path(args.model)
     session = _load_session(model, args.gpu_id, json_events=True,
                             provider=args.provider)
-    # Include active EPs and the requested provider in the ready
-    # event so the handler can surface both in job responses —
-    # RunPod's worker logs aren't reachable via API, so we route
-    # diagnostics through the response payload instead of stderr.
+    batched_session = None
+    batched_model_path = getattr(args, "batched_model", None)
+    if batched_model_path:
+        bp = Path(batched_model_path)
+        if bp.exists():
+            batched_session = _load_session(bp, args.gpu_id, json_events=True,
+                                            provider=args.provider)
+            print(f"[trt] batched engine loaded: {bp.name}",
+                  file=sys.stderr, flush=True)
+        else:
+            print(f"[trt] batched engine path missing: {bp} — "
+                  f"falling back to primary-only routing",
+                  file=sys.stderr, flush=True)
+
+    # Surface BOTH engines in the ready event so the handler can echo
+    # them back to callers — `engine_secondary` is null when no batched
+    # engine was loaded. Helps benchmark callers attribute timings.
     _emit(True, event="ready",
           providers=session.get_providers(),
           requested_provider=args.provider,
-          model=model.name)
+          model=model.name,
+          batched_model=(Path(batched_model_path).name if batched_session else None))
 
     for line in sys.stdin:
         line = line.strip()
@@ -543,7 +559,7 @@ def run_serve(args: argparse.Namespace) -> int:
         # Branch on shape: `inputs` (plural) → batched; `input` → single.
         if "inputs" in job and "outputs" in job:
             try:
-                _serve_one_batch(session, job, job_id, np)
+                _serve_one_batch(session, batched_session, job, job_id, np)
             except Exception as e:  # noqa: BLE001
                 _emit(True, event="error", id=job_id, msg=str(e))
             continue
@@ -558,11 +574,16 @@ def run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _serve_one_batch(session, job: dict, job_id: str, np) -> None:
-    """Batched JSONL handler. All inputs must already share the same
-    (H, W) — the handler-side router (handler.py:_process_one_image)
-    is responsible for grouping. We re-validate here as a safety net
-    and raise loudly if violated, rather than silently truncating."""
+def _serve_one_batch(primary_session, batched_session,
+                     job: dict, job_id: str, np) -> None:
+    """Batched JSONL handler. Routes to the batched session if one
+    is loaded AND the request fits its profile; otherwise falls back
+    to iterating per-image on the primary session.
+
+    All inputs must already share the same (H, W) — the handler-side
+    router (handler.py:_process_batch) groups by shape. We
+    re-validate here and raise on violation rather than silently
+    truncate."""
     inputs = [Path(p) for p in job["inputs"]]
     outputs = [Path(p) for p in job["outputs"]]
     if len(inputs) != len(outputs):
@@ -584,27 +605,53 @@ def _serve_one_batch(session, job: dict, job_id: str, np) -> None:
                 f"then {chw.shape} at {p.name}. Group by shape upstream."
             )
         chws.append(chw)
-    # Stack along the existing batch dim; each chw is already (1,3,H,W).
-    batched = np.concatenate(chws, axis=0)
+    n = len(chws)
+    _, _, h, w = ref_shape
 
-    # _run_inference returns a list of arrays — for both ORT and
-    # TrtSession the first entry is the NCHW output. _postprocess
-    # expects a 4-D NCHW tensor; we pass slices so each item lands
-    # at its own output path.
-    result = _run_inference(session, batched)
-    out_tensor = result[0]  # shape (N, 3, 4H, 4W)
+    # Decide which session takes this batch.
+    use_batched = (
+        batched_session is not None
+        and n >= 2
+        and isinstance(batched_session, TrtSession)
+        and _shape_fits_session(batched_session, n, h, w)
+    )
 
-    per_item: list[dict] = []
-    for i, out_path in enumerate(outputs):
-        # _postprocess_and_save consumes `out_tensor[0]` (drops batch
-        # dim). Pass a 1-element slice so the existing helper stays
-        # path-agnostic between single + batched callers.
-        single = out_tensor[i:i + 1]
-        _postprocess_and_save(single, out_path)
-        per_item.append({"output": str(out_path)})
+    if use_batched:
+        # Stack and run a single forward pass on the batched engine.
+        batched_chw = np.concatenate(chws, axis=0)
+        result = _run_inference(batched_session, batched_chw)
+        out_tensor = result[0]  # (N, 3, 4H, 4W)
+        per_item = []
+        for i, out_path in enumerate(outputs):
+            _postprocess_and_save(out_tensor[i:i + 1], out_path)
+            per_item.append({"output": str(out_path)})
+        engine_used = "batched"
+    else:
+        # Fallback: iterate per-image on the primary session. Same
+        # behaviour as the legacy single-engine path; loses the
+        # batching benefit but always produces correct output.
+        per_item = []
+        for chw, out_path in zip(chws, outputs):
+            result = _run_inference(primary_session, chw)
+            _postprocess_and_save(result[0], out_path)
+            per_item.append({"output": str(out_path)})
+        engine_used = "primary"
 
     _emit(True, event="done", id=job_id, batched=True,
-          results=per_item, batch_size=len(inputs))
+          results=per_item, batch_size=n, engine=engine_used)
+
+
+def _shape_fits_session(sess: "TrtSession", n: int, h: int, w: int) -> bool:
+    """Probe a TrtSession's profile 0 max shape and return whether
+    (n, h, w) is admissible. The batched engine has a single profile
+    (profile 0) so this is straightforward — no profile-switching
+    decision involved."""
+    try:
+        max_shape = sess._engine.get_tensor_profile_shape(sess._input_name, 0)[2]
+        max_n, _, max_h, max_w = max_shape
+        return n <= max_n and h <= max_h and w <= max_w
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def main() -> int:
@@ -612,6 +659,11 @@ def main() -> int:
     p.add_argument("--input", help="input image (one-shot mode)")
     p.add_argument("--output", help="output image (one-shot mode)")
     p.add_argument("--model", required=True, help="path to .onnx model file")
+    p.add_argument("--batched-model", default=None,
+                   help="optional second engine path (TRT-direct only). When "
+                        "set, batched JSONL frames route to this engine; "
+                        "single frames stay on --model. Pairs with the "
+                        "batched-mode artefacts from build/compile_engine.py.")
     p.add_argument("--gpu-id", type=int, default=0, help="CUDA device id; -1 = CPU")
     p.add_argument("--provider", choices=_PROVIDER_CHOICES, default="auto",
                    help="execution provider: cpu | cuda | trt | auto. "

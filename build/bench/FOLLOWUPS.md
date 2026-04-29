@@ -25,13 +25,38 @@ users mostly aren't on — defer until there's a real ask.
 
 ## 1. True batched inference
 
-**Status: partially implemented + reverted, after a real perf
-regression on the first attempt.** The handler routing
-(`handler.py:_process_batch`), helper protocol
-(`runtime/upscaler.py` `_serve_one_batch`), and TrtSession
-profile-selection are all in place — they're DORMANT until a
-working batched engine ships. See "Why dormant" below for what
-went wrong on the first attempt.
+**Status: SHIPPED.** Handler routing, helper protocol, and
+TrtSession routing are live. Batched engines are published for
+both sm89 (rtx-4090, l40s, l4, RTX 6000 Ada, RTX 4000 Ada) and
+sm86 (rtx-3090, A40, A6000, A5000, A4000, A4500) under the
+`engine-batched` manifest variant. The handler fetches both the
+single-mode and batched-mode engines at boot; the batched fetch
+is best-effort and a missing artifact just falls back to per-image
+iteration with no error.
+
+**Measured perf on rtx-4090 trt:**
+
+| size | batch=1 (primary) | batch=4 (batched) | per-image win |
+|---|---|---|---|
+| 512×512 | 288 ms | 259 ms | ~10% |
+| 720×720 | 719 ms | 531 ms | **~26%** |
+
+The win is bounded by Real-ESRGAN being compute-bound — batching
+amortises kernel launch / IO-binding overhead (~30-200 ms per
+forward pass) but doesn't reduce per-image compute. At 720×720
+that overhead is ~26% of the per-image budget; at 512×512 it's
+~10%. The 2-4× I had projected up front was wrong for a
+compute-bound model.
+
+**What didn't work (left here for context).** First attempt was
+a single dual-profile engine — one TRT engine with two
+optimisation profiles, single-image + batched. Hit a 5-22×
+regression because TRT's tactic search has to pick implementations
+that satisfy BOTH profiles' memory budgets, and the shared-budget
+tactics are markedly worse than what each profile alone would
+get. Reverted that, pivoted to **two separate single-profile
+engines** routed by the handler. See
+`feedback_dual_profile_regression` memory.
 
 **The problem the sweep surfaced.** Per-image exec time is flat
 across batch sizes (575 ms at b=1 == 565 ms at b=64 on l40s/trt).

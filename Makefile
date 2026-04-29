@@ -155,7 +155,9 @@ artifacts-onnx:
 artifacts-engine:
 	cd build && python3 compile_engine.py \
 		--onnx dist/realesrgan-x4plus_fp16.onnx \
-		--auto-detect-gpu
+		--auto-detect-gpu \
+		--profile-mode $(PROFILE_MODE)
+PROFILE_MODE ?= single
 
 manifest:
 	python3 build/update_manifest.py
@@ -186,7 +188,8 @@ remote-build-engine:
 		echo "  build/.with-iosuite-key make remote-build-engine GPU_CLASS=$(GPU_CLASS)"; \
 		exit 1; \
 	fi
-	python3 build/remote_build.py --gpu-class $(GPU_CLASS)
+	python3 build/remote_build.py --gpu-class $(GPU_CLASS) \
+		--make-args "PROFILE_MODE=$(PROFILE_MODE)"
 
 # ─── RunPod serverless deploy + cold-start smoke test ───────────────
 # Deploys the runpod image to a RunPod serverless endpoint, runs a

@@ -140,46 +140,52 @@ def compile_engine(
     out_path: Path,
     workspace_bytes: int,
     fp16: bool,
+    profile_mode: str = "single",
     max_batch: int = 4,
     opt_batch: int = 4,
     batched_max_dim: int = 720,
 ) -> None:
-    """Build a Real-ESRGAN x4 TRT engine with two optimisation profiles:
+    """Build a Real-ESRGAN x4 TRT engine in one of two modes:
 
-      Profile 0 — single-image, full size range
-        min=(1, 3, 64, 64), opt=(1, 3, 720, 720), max=(1, 3, 1280, 1280)
+      profile_mode="single" (default) — single-image profile, full
+          size range. The artefact other parts of the system have
+          always served:
+              min=(1, 3, 64, 64), opt=(1, 3, 720, 720),
+              max=(1, 3, 1280, 1280)
 
-      Profile 1 — batched, smaller size range
-        min=(1, 3, 64, 64), opt=(opt_batch, 3, 512, 512),
-        max=(max_batch, 3, batched_max_dim, batched_max_dim)
+      profile_mode="batched" — batched-only profile. The engine
+          REJECTS batch=1 — it's purpose-built for the multi-image
+          path, so TRT's tactic selector isn't compromised by also
+          having to handle the single-image case (an earlier
+          dual-profile attempt regressed per-image perf 5-22×; see
+          feedback_dual_profile_regression memory):
+              min=(2, 3, 64, 64), opt=(opt_batch, 3, 512, 512),
+              max=(max_batch, 3, batched_max_dim, batched_max_dim)
 
-    Why two profiles. Real-ESRGAN's intermediate feature maps after the
-    2× pixel-shuffles are `(batch × 64 × 4H × 4W)` elements. TRT's
-    INT32 element-count limit (2^31 ≈ 2.15B) caps the product:
+    Real-ESRGAN's intermediate feature maps after the 2× pixel-
+    shuffles are `(batch × 64 × 4H × 4W)` elements; TRT's INT32
+    element-count cap (2^31 ≈ 2.15B) limits the product. Single-mode
+    handles batch=1 across the full size range; batched-mode trades
+    size range for batch range. WarmHelper holds both TrtSession
+    instances and routes per-request by input shape.
 
-        batch × 64 × (4 × max_dim)² < 2^31
-        ⇒ batch × max_dim² ≲ 2.1M
-
-    At max_dim=1280, that constrains max_batch to 1 — no batched
-    profile fits at the full size range. Two profiles fix it: profile
-    0 keeps the full size range for single-image requests; profile 1
-    enables batched inference for smaller images (where most video-
-    frame workloads live). The TrtSession in runtime/upscaler.py
-    picks the profile per request based on the input shape.
-
-    Engine size grows ~50% from the wider tactic search across two
-    profiles; build time grows from ~4 min to ~12 min on a 4090.
+    Build time: ~4 min single, ~6-8 min batched.
     """
     try:
         import tensorrt as trt
     except ImportError as e:
         sys.exit(f"[B] tensorrt python module missing: {e}")
 
+    if profile_mode not in ("single", "batched"):
+        sys.exit(f"[B] unknown profile_mode: {profile_mode!r}")
+
     print(f"[B] building engine from {onnx_path.name}")
-    print(f"[B] workspace = {workspace_bytes / (1<<30):.1f} GiB, fp16 = {fp16}")
-    print(f"[B] profile 0 (single):  min=1×64x64  opt=1×720x720  max=1×1280x1280")
-    print(f"[B] profile 1 (batched): min=1×64x64  opt={opt_batch}×512x512  "
-          f"max={max_batch}×{batched_max_dim}x{batched_max_dim}")
+    print(f"[B] mode = {profile_mode}, workspace = {workspace_bytes / (1<<30):.1f} GiB, fp16 = {fp16}")
+    if profile_mode == "single":
+        print(f"[B] profile: min=1×64x64  opt=1×720x720  max=1×1280x1280")
+    else:
+        print(f"[B] profile: min=2×64x64  opt={opt_batch}×512x512  "
+              f"max={max_batch}×{batched_max_dim}x{batched_max_dim}")
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -199,30 +205,32 @@ def compile_engine(
     if fp16:
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # Profile 0: single-image, full size range — keeps backwards
-    # compatibility with the original engine. Used by the handler for
-    # any request where N=1 OR the per-image dim exceeds the batched
-    # profile's cap.
-    profile_single = builder.create_optimization_profile()
-    profile_single.set_shape(
-        "input",
-        min=(1, 3, 64, 64),
-        opt=(1, 3, 720, 720),
-        max=(1, 3, 1280, 1280),
-    )
-    config.add_optimization_profile(profile_single)
-
-    # Profile 1: batched, smaller size range. INT32 cap math (above)
-    # forces this size×batch trade-off. Default 4×720 fits comfortably
-    # (1.06B at opt, 2.12B at max — both under 2^31).
-    profile_batched = builder.create_optimization_profile()
-    profile_batched.set_shape(
-        "input",
-        min=(1, 3, 64, 64),
-        opt=(opt_batch, 3, 512, 512),
-        max=(max_batch, 3, batched_max_dim, batched_max_dim),
-    )
-    config.add_optimization_profile(profile_batched)
+    profile = builder.create_optimization_profile()
+    if profile_mode == "single":
+        # The proven artefact — single-image, full size range. Engine
+        # rejects batch>1 at set_input_shape. Tactic selector picks
+        # implementations purely tuned for the (1, 3, H, W) case.
+        profile.set_shape(
+            "input",
+            min=(1, 3, 64, 64),
+            opt=(1, 3, 720, 720),
+            max=(1, 3, 1280, 1280),
+        )
+    else:  # batched
+        # Batched-only — engine REJECTS batch=1. Pairs with the
+        # single-mode engine via the handler's per-request routing.
+        # Min=2 keeps tactic selection focused on the multi-image
+        # case; min=1 would dilute it (same dual-profile failure
+        # mode in different clothing). INT32 cap math:
+        #     max_batch × 64 × (4 × batched_max_dim)² < 2^31
+        # Default 4 × 720 = 2.12B, just under.
+        profile.set_shape(
+            "input",
+            min=(2, 3, 64, 64),
+            opt=(opt_batch, 3, 512, 512),
+            max=(max_batch, 3, batched_max_dim, batched_max_dim),
+        )
+    config.add_optimization_profile(profile)
 
     print(f"[B] compiling — this can take 10-30 min on first build")
     engine_bytes = builder.build_serialized_network(network, config)
@@ -246,18 +254,19 @@ def main() -> int:
     p.add_argument("--trt-version", help="e.g. 10.8 (overrides auto-detect)")
     p.add_argument("--workspace-bytes", type=int, default=DEFAULT_WORKSPACE_BYTES)
     p.add_argument("--fp32", action="store_true", help="disable FP16 (default: FP16 on)")
+    p.add_argument("--profile-mode", choices=["single", "batched"], default="single",
+                   help="single = single-image profile (1×64-1280); batched = "
+                        "batched-only profile (2..max_batch × 64-batched_max_dim). "
+                        "Build both as separate engines and pair them at runtime "
+                        "via the handler's per-request routing.")
     p.add_argument("--max-batch", type=int, default=4,
-                   help="upper bound for the BATCHED profile (engine has "
-                        "a separate single-image profile that always covers "
-                        "1..1280). 4 fits within TRT's INT32 elem-count "
-                        "limit at the batched-profile's max image dim.")
+                   help="batched mode only: upper bound for batch dim. 4 fits "
+                        "TRT's INT32 elem-count cap at the batched max image dim.")
     p.add_argument("--opt-batch", type=int, default=4,
-                   help="batched profile's autotune-target batch size.")
+                   help="batched mode only: autotune-target batch size.")
     p.add_argument("--batched-max-dim", type=int, default=720,
-                   help="batched profile's max image dim (square). 720 is "
-                        "the largest that fits batch=4 under TRT's INT32 "
-                        "elem-count cap. Lower this to enable larger "
-                        "batches at the cost of size range.")
+                   help="batched mode only: max image dim (square). 720 is "
+                        "the largest that fits batch=4 under the INT32 cap.")
     args = p.parse_args()
 
     if not args.onnx.exists():
@@ -273,18 +282,19 @@ def main() -> int:
     args.trt_version = args.trt_version or _detect_trt_version()
 
     precision = "fp32" if args.fp32 else "fp16"
-    # Include max_batch in the filename so the new b16-profile engines
-    # don't collide with the old b1-profile artefacts already on
-    # GH Releases. Manifest sha256 is the canonical identity, but the
-    # filename helps humans + log inspection at a glance.
+    # Filename suffix encodes the profile mode so single + batched
+    # engines for the same (gpu, arch, trt) pair don't collide as GH
+    # release assets. Single mode keeps the legacy filename.
+    mode_suffix = "" if args.profile_mode == "single" else "_batched"
     out_name = (
         f"realesrgan-x4plus-{args.gpu_class}-{args.sm_arch}-"
-        f"trt{args.trt_version}_{precision}_b{args.max_batch}.engine"
+        f"trt{args.trt_version}_{precision}{mode_suffix}.engine"
     )
     out_path = args.output / out_name
 
     compile_engine(args.onnx, out_path, args.workspace_bytes,
                    fp16=not args.fp32,
+                   profile_mode=args.profile_mode,
                    max_batch=args.max_batch, opt_batch=args.opt_batch,
                    batched_max_dim=args.batched_max_dim)
     return 0

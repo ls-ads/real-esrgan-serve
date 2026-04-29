@@ -51,6 +51,34 @@
       "license": "BSD-3-Clause (Real-ESRGAN upstream)",
       "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
       "notes": "TensorRT 10.1 single-profile engine for sm86 — works on any sm86 GPU (RTX 3090, A40, A6000, A5000, A4000, A4500). Built on A40. (A dual-profile _b4 variant exists on the release but is NOT in this manifest — see FOLLOWUPS.md.)"
+    },
+    {
+      "name": "realesrgan-x4plus",
+      "variant": "engine-batched",
+      "gpu_class": "l40s",
+      "sm_arch": "sm89",
+      "trt_version": "10.1",
+      "filename": "realesrgan-x4plus-l40s-sm89-trt10.1_fp16_batched.engine",
+      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0-rc1/realesrgan-x4plus-l40s-sm89-trt10.1_fp16_batched.engine",
+      "sha256": "37b0624172341348df19490caae9bb9d19f38aed752bfe2340bc3a9550a219d0",
+      "bytes": 36640132,
+      "license": "BSD-3-Clause (Real-ESRGAN upstream)",
+      "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
+      "notes": "TensorRT 10.1 BATCHED-ONLY engine for sm89. Profile: min=2×64×64, opt=4×512×512, max=4×720×720. Pairs with the single-profile sm89 engine (variant=engine) at runtime — handler routes batches of 2-4 same-shape images here, single images stay on the primary engine."
+    },
+    {
+      "name": "realesrgan-x4plus",
+      "variant": "engine-batched",
+      "gpu_class": "a40",
+      "sm_arch": "sm86",
+      "trt_version": "10.1",
+      "filename": "realesrgan-x4plus-a40-sm86-trt10.1_fp16_batched.engine",
+      "url": "https://github.com/ls-ads/real-esrgan-serve/releases/download/v0.2.0-rc1/realesrgan-x4plus-a40-sm86-trt10.1_fp16_batched.engine",
+      "sha256": "d53aa2185f1cae58586d76471977dd82e31c4003826bbd4b7e032c847f536f85",
+      "bytes": 36146780,
+      "license": "BSD-3-Clause (Real-ESRGAN upstream)",
+      "license_url": "https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE",
+      "notes": "TensorRT 10.1 BATCHED-ONLY engine for sm86. Profile: min=2×64×64, opt=4×512×512, max=4×720×720. Pairs with the single-profile sm86 engine."
     }
   ]
 }
