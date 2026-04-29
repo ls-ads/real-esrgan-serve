@@ -81,12 +81,19 @@ GPU_CLASS_TO_POOL: dict[str, str] = {
     "rtx-4090":    "ADA_24",          # 24GB Ada
     "rtx-4080":    "ADA_24",
     "rtx-4080-s":  "ADA_24",
-    "rtx-3090":    "AMPERE_24",       # 24GB Ampere
+    "rtx-3090":    "AMPERE_24",       # 24GB Ampere (groups L4 too per RunPod docs)
     "rtx-3090-ti": "AMPERE_24",
-    "l40s":        "ADA_48_PRO",      # 48GB Ada professional
-    "l40":         "ADA_48_PRO",
-    "l4":          "ADA_24",
+    "l4":          "AMPERE_24",       # Ada 24GB but RunPod buckets it w/ Ampere 24
+    "a5000":       "AMPERE_24",
+    "l40":         "ADA_48_PRO",      # 48GB Ada professional
+    "l40s":        "ADA_48_PRO",
+    "rtx-6000":    "ADA_48_PRO",      # RTX 6000 Ada
     "a40":         "AMPERE_48",       # 48GB Ampere
+    "a6000":       "AMPERE_48",
+    "a4000":       "AMPERE_16",       # 16GB pool — mixes A4000 (sm86) + RTX 4000/2000 Ada (sm89)
+    "a4500":       "AMPERE_16",       # 20GB but RunPod docs put it here
+    "rtx-4000":    "AMPERE_16",       # RTX 4000 Ada
+    "rtx-2000":    "AMPERE_16",       # RTX 2000 Ada
     "a100":        "AMPERE_80",       # 80GB Ampere
     "a100-sxm":    "AMPERE_80",
     "h100":        "HOPPER_141",      # 80/141GB Hopper
