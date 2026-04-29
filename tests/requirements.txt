@@ -1,0 +1,11 @@
+# Test dependencies. Kept separate from runtime requirements (the
+# runtime image installs only what each flavor needs at request-path
+# time). `pip install -r tests/requirements.txt` is enough to run the
+# unit + property tests; live tests only need `requests` from this
+# list (already in the runpod image's transitive tree).
+pytest>=7.0
+hypothesis>=6.0
+Pillow>=10.4
+numpy>=1.26
+pydantic>=2.9
+requests>=2.32

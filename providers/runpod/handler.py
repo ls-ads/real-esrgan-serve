@@ -307,38 +307,49 @@ class WarmHelper:
             self._pending.pop(job_id, None)
 
 
-# Bootstrap once per container — warmed up before RunPod starts
-# delivering jobs.
-#
-# CRITICAL: catch every exception. RunPod's worker logs aren't
-# fetchable via API (verified — /v2/<id>/logs is console-only), so
-# if the WarmHelper init crashes we'd see only a TimeoutError on
-# the deploy side with no diagnosis. By stashing the exception in
-# _BOOT_ERROR and letting the runpod SDK come up cleanly, the
-# handler() function can echo the failure into every job response
-# — that's the only programmatic channel back to the operator.
+# Bootstrap state. Populated by _bootstrap() at module-as-script
+# execution (see __main__ guard at the bottom). Tests importing this
+# module won't trigger _bootstrap, so the WarmHelper init + runpod
+# SDK start don't run during unit tests.
 _HELPER: Optional["WarmHelper"] = None
 _BOOT_ERROR: Optional[dict] = None
-try:
-    import traceback
-    _model_path = _resolve_model_path()
-    _HELPER = WarmHelper(
-        model=_model_path,
-        gpu_id=int(os.environ.get("GPU_ID", "0")),
-        provider=PROVIDER,
-    )
-except BaseException as _boot_exc:  # noqa: BLE001 — really need everything
-    _BOOT_ERROR = {
-        "phase": "boot",
-        "type": type(_boot_exc).__name__,
-        "msg": str(_boot_exc),
-        "traceback": traceback.format_exc(),
-        "provider": PROVIDER,
-        "model_name": MODEL_NAME,
-        "model_variant": MODEL_VARIANT,
-    }
-    log.error(f"BOOT FAILURE — handler will return boot_error on each job: "
-              f"{_BOOT_ERROR['type']}: {_BOOT_ERROR['msg']}")
+
+
+def _bootstrap() -> None:
+    """Module-level bootstrap. Wrapped in a function so tests can
+    import handler without triggering WarmHelper init or the runpod
+    SDK's queue poller. Production runs the module as a script
+    (`python3 -u /app/handler.py`), which fires the __main__ guard
+    below and calls this.
+
+    CRITICAL: catch every exception. RunPod's worker logs aren't
+    fetchable via API (verified — /v2/<id>/logs is console-only), so
+    if the WarmHelper init crashes we'd see only a TimeoutError on
+    the deploy side with no diagnosis. By stashing the exception in
+    _BOOT_ERROR and letting the runpod SDK come up cleanly, the
+    handler() function can echo the failure into every job response
+    — that's the only programmatic channel back to the operator."""
+    global _HELPER, _BOOT_ERROR
+    try:
+        import traceback
+        _model_path = _resolve_model_path()
+        _HELPER = WarmHelper(
+            model=_model_path,
+            gpu_id=int(os.environ.get("GPU_ID", "0")),
+            provider=PROVIDER,
+        )
+    except BaseException as _boot_exc:  # noqa: BLE001 — really need everything
+        _BOOT_ERROR = {
+            "phase": "boot",
+            "type": type(_boot_exc).__name__,
+            "msg": str(_boot_exc),
+            "traceback": traceback.format_exc(),
+            "provider": PROVIDER,
+            "model_name": MODEL_NAME,
+            "model_variant": MODEL_VARIANT,
+        }
+        log.error(f"BOOT FAILURE — handler will return boot_error on each job: "
+                  f"{_BOOT_ERROR['type']}: {_BOOT_ERROR['msg']}")
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -455,4 +466,6 @@ def handler(job):
         return {"error": str(e)}
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    _bootstrap()
+    runpod.serverless.start({"handler": handler})

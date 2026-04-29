@@ -1,4 +1,4 @@
-.PHONY: build clean test fmt vet prep-embed \
+.PHONY: build clean test test-unit test-py test-go test-live fmt vet prep-embed \
         docker-cpu docker-cuda docker-trt \
         docker-runpod-cpu docker-runpod-cuda docker-runpod-trt \
         docker-push-cpu docker-push-cuda docker-push-trt \
@@ -30,8 +30,48 @@ build: prep-embed
 clean:
 	rm -rf $(BIN_DIR)
 
-test:
+# `make test` = unit-only sweep across both languages. Live tests are
+# excluded; run `make test-live` after deploying a long-lived endpoint
+# (see tests/README.md). The python tests run inside the cpu image so
+# the host machine doesn't need pytest/hypothesis/Pillow installed —
+# the same image is what we ship as the cpu flavor, so this also
+# verifies tests work in the runtime environment.
+TEST_IMAGE ?= real-esrgan-serve:cpu-dev
+
+test: test-go test-py
+
+test-unit: test
+
+test-go:
 	go test ./...
+
+test-py:
+	@docker image inspect $(TEST_IMAGE) >/dev/null 2>&1 || { \
+	  echo "test-py requires the cpu image; run 'make docker-cpu' first."; \
+	  echo "  (it pre-bakes Python + numpy + Pillow + onnxruntime so we"; \
+	  echo "   only need to layer pytest+hypothesis at run time)"; \
+	  exit 1; \
+	}
+	docker run --rm -v $(PWD):/repo -w /repo --entrypoint /bin/bash $(TEST_IMAGE) -c '\
+	  pip3 install --quiet -r tests/requirements.txt 2>&1 | tail -1; \
+	  python3 -m pytest tests/ -m "not live" -v --tb=short \
+	'
+
+# Live tests require an active RunPod endpoint and a real API key.
+# Skips cleanly if env vars aren't set; otherwise submits real jobs
+# (each test = ~one GPU-second of cost). See tests/README.md for setup.
+test-live:
+	@if [ -z "$$RUNPOD_API_KEY" ]; then \
+	  echo "test-live requires RUNPOD_API_KEY (use build/.with-iosuite-key wrapper)."; \
+	  echo "  RUNPOD_ENDPOINT_ID also required — see tests/README.md."; \
+	  exit 1; \
+	fi
+	docker run --rm -v $(PWD):/repo -w /repo \
+	  -e RUNPOD_API_KEY -e RUNPOD_ENDPOINT_ID \
+	  --entrypoint /bin/bash $(TEST_IMAGE) -c '\
+	  pip3 install --quiet -r tests/requirements.txt 2>&1 | tail -1; \
+	  python3 -m pytest tests/ -m live -v --tb=short \
+	'
 
 fmt:
 	go fmt ./...
