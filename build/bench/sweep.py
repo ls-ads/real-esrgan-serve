@@ -83,10 +83,15 @@ def _deploy(client: rpd.RunPodClient, gpu_class: str, image: str,
 
 def _run_one(api_key: str, *, endpoint_id: str, gpu_class: str,
              flavor: str, image_tag: str, max_batch: int,
-             db_path: Path) -> None:
-    """Run all three workloads against an endpoint, in order. Each
+             db_path: Path,
+             workload_names: Optional[list[str]] = None) -> None:
+    """Run the requested workloads against an endpoint, in order. Each
     workload is its own row in `runs`; failures don't stop the next
-    workload (we want partial data on bad runs)."""
+    workload (we want partial data on bad runs).
+
+    `workload_names`=None runs the standard trio (cold_start, batch_sweep,
+    sustained_concurrent). Pass a subset to scope a re-sweep, e.g.
+    ["image_size_sweep"] to only run the resolution scan."""
     sm_arch = schema.GPU_CLASS_TO_SM.get(gpu_class)
     common = dict(
         endpoint_id=endpoint_id,
@@ -98,12 +103,29 @@ def _run_one(api_key: str, *, endpoint_id: str, gpu_class: str,
         db_path=db_path,
     )
 
-    for workload in (
-        workloads.workload_cold_start(),
-        workloads.workload_batch_sweep(max_batch=max_batch),
-        workloads.workload_sustained_concurrent(concurrency=4,
-                                                jobs_per_worker=4),
-    ):
+    if workload_names is None:
+        ws = [
+            workloads.workload_cold_start(),
+            workloads.workload_batch_sweep(max_batch=max_batch),
+            workloads.workload_sustained_concurrent(concurrency=4,
+                                                    jobs_per_worker=4),
+        ]
+    else:
+        ws = []
+        for name in workload_names:
+            if name == "cold_start":
+                ws.append(workloads.workload_cold_start())
+            elif name == "batch_sweep":
+                ws.append(workloads.workload_batch_sweep(max_batch=max_batch))
+            elif name == "sustained_concurrent":
+                ws.append(workloads.workload_sustained_concurrent(
+                    concurrency=4, jobs_per_worker=4))
+            elif name == "image_size_sweep":
+                ws.append(workloads.workload_image_size_sweep())
+            else:
+                raise SystemExit(f"unknown workload: {name}")
+
+    for workload in ws:
         try:
             runner.run_workload(workload=workload, **common)
         except Exception as e:  # noqa: BLE001
@@ -123,6 +145,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--only-flavor", action="append", default=None,
                    choices=["cuda", "trt"],
                    help="restrict to a subset of flavors (repeatable)")
+    p.add_argument("--workloads", action="append", default=None,
+                   choices=["cold_start", "batch_sweep",
+                            "sustained_concurrent", "image_size_sweep"],
+                   help="restrict to a subset of workloads per pair "
+                        "(repeatable). Default = standard trio.")
     args = p.parse_args(argv)
 
     api_key = os.environ.get("RUNPOD_API_KEY")
@@ -158,7 +185,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             time.sleep(15)
             _run_one(api_key, endpoint_id=endpoint_id, gpu_class=gpu_class,
                      flavor=flavor, image_tag=image_tag, max_batch=max_batch,
-                     db_path=db_path)
+                     db_path=db_path, workload_names=args.workloads)
         except Exception as e:  # noqa: BLE001
             print(f"[sweep] {flavor}/{gpu_class} FAILED: {e}", file=sys.stderr)
         finally:

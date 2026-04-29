@@ -259,6 +259,8 @@ def _build_workload(name: str, image_w: int, image_h: int,
             concurrency=concurrency, jobs_per_worker=jobs_per_worker,
             image_w=image_w, image_h=image_h,
         )
+    if name == "image_size_sweep":
+        return workloads.workload_image_size_sweep()
     raise SystemExit(f"unknown workload: {name}")
 
 

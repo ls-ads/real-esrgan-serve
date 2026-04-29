@@ -178,9 +178,47 @@ def workload_sustained_concurrent(concurrency: int = 4,
     )
 
 
+def workload_image_size_sweep(sizes: list[int] = None,
+                              include_batch_4: bool = True) -> Workload:
+    """Sweep across image resolutions at batch=1 (and optionally batch=4
+    where the engine admits it). Reveals how per-image cost scales with
+    pixel count — informs "best tier for my resolution" decisions and
+    quantifies the batched-engine win across sizes.
+
+    Default sizes span the engine's optimisation profiles:
+      256, 384, 512 — small (TRT often struggles to saturate small
+                     inputs; cost/image is launch-overhead-dominated)
+      720           — engine's batched profile max + single-mode opt
+      1024, 1280    — single-mode only (above batched profile cap;
+                     handler routes through primary engine)
+    """
+    sizes = sizes or [256, 384, 512, 720, 1024, 1280]
+    specs = [JobSpec(name="warmup",
+                     batch_size=1, image_w=512, image_h=512,
+                     telemetry=False, cold_start=True)]
+    for s in sizes:
+        specs.append(JobSpec(name=f"size_{s}_b1",
+                             batch_size=1, image_w=s, image_h=s,
+                             telemetry=True))
+        # Only add batch=4 for sizes the batched engine accepts (≤720).
+        # Larger sizes fall back to per-image iteration on the primary
+        # engine, which is what batch=1 already measures — no new info.
+        if include_batch_4 and s <= 720:
+            specs.append(JobSpec(name=f"size_{s}_b4",
+                                 batch_size=4, image_w=s, image_h=s,
+                                 telemetry=True))
+    return Workload(
+        name=f"image_size_sweep",
+        description=f"Per-image cost across sizes {sizes}; batch=1 always, "
+                    f"batch=4 for sizes ≤ 720 (batched-engine reach).",
+        specs=specs,
+    )
+
+
 # Convenience registry the CLI dispatches against.
 WORKLOADS: dict[str, Callable[..., Workload]] = {
     "cold_start": workload_cold_start,
     "batch_sweep": workload_batch_sweep,
     "sustained_concurrent": workload_sustained_concurrent,
+    "image_size_sweep": workload_image_size_sweep,
 }
