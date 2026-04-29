@@ -40,7 +40,7 @@ from typing import Optional
 # already on sys.path because we're inside it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from build import runpod_deploy as rpd  # noqa: E402
-from build.bench import runner, schema, workloads  # noqa: E402
+from build.bench import runner, schema, spend, workloads  # noqa: E402
 
 
 # Each entry: (gpu_class, flavor, image_tag, max_batch).
@@ -85,7 +85,8 @@ def _deploy(client: rpd.RunPodClient, gpu_class: str, image: str,
 def _run_one(api_key: str, *, endpoint_id: str, gpu_class: str,
              flavor: str, image_tag: str, max_batch: int,
              db_path: Path,
-             workload_names: Optional[list[str]] = None) -> None:
+             workload_names: Optional[list[str]] = None,
+             sweep_id: Optional[str] = None) -> None:
     """Run the requested workloads against an endpoint, in order. Each
     workload is its own row in `runs`; failures don't stop the next
     workload (we want partial data on bad runs).
@@ -102,6 +103,7 @@ def _run_one(api_key: str, *, endpoint_id: str, gpu_class: str,
         gpu_class=gpu_class,
         sm_arch=sm_arch,
         db_path=db_path,
+        sweep_id=sweep_id,
     )
 
     if workload_names is None:
@@ -188,14 +190,37 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     db_path = Path(args.db_path)
     started = datetime.now(timezone.utc)
-    print(f"[sweep] {started.isoformat()} — {len(matrix)} (gpu, flavor) "
-          f"pairs to test", file=sys.stderr)
+    sweep_id = str(uuid.uuid4())
+    print(f"[sweep] {started.isoformat()} — sweep_id={sweep_id}, "
+          f"{len(matrix)} (gpu, flavor) pairs to test", file=sys.stderr)
+
+    # Open the DB once at sweep start to seed schemas + take the
+    # opening balance snapshot. The runner reopens per run; that's
+    # fine — SQLite handles multiple connections.
+    conn = schema.open_db(db_path)
+    schema.init_schema(conn)
+    spend.init_schema(conn)
+    snap = spend.record_snapshot(conn, api_key=api_key, phase="sweep_start",
+                                 sweep_id=sweep_id,
+                                 notes=f"matrix={len(matrix)} pairs")
+    if snap:
+        print(f"[sweep] balance start: ${snap['balance_usd']:.4f} "
+              f"(spend rate ${snap['spend_per_hr_usd']:.4f}/hr)",
+              file=sys.stderr)
+    conn.close()
 
     for i, (gpu_class, flavor, image_tag, max_batch) in enumerate(matrix, 1):
         endpoint_name = f"bench-{flavor}-{gpu_class}-{int(time.time())}"
         endpoint_id: Optional[str] = None
-        print(f"\n[sweep] === {i}/{len(matrix)} {flavor}/{gpu_class} === "
+        pair_label = f"{flavor}/{gpu_class}"
+        print(f"\n[sweep] === {i}/{len(matrix)} {pair_label} === "
               f"image={image_tag}", file=sys.stderr)
+        # Per-pair snapshots open + close their own connection so the
+        # runner-side connections don't fight us for write locks.
+        pair_conn = schema.open_db(db_path)
+        spend.record_snapshot(pair_conn, api_key=api_key, phase="pair_start",
+                              sweep_id=sweep_id, pair_label=pair_label)
+        pair_conn.close()
         try:
             endpoint_id = _deploy(rp, gpu_class, image_tag, endpoint_name, auth_id,
                                   workers_max=args.workers_max)
@@ -203,11 +228,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Brief pause: workers idle out (idle_timeout=10), so the
             # cold_start workload's first job actually hits a cold spawn.
             time.sleep(15)
+            pair_conn = schema.open_db(db_path)
+            spend.record_snapshot(pair_conn, api_key=api_key,
+                                  phase="pair_after_deploy",
+                                  sweep_id=sweep_id, pair_label=pair_label)
+            pair_conn.close()
             _run_one(api_key, endpoint_id=endpoint_id, gpu_class=gpu_class,
                      flavor=flavor, image_tag=image_tag, max_batch=max_batch,
-                     db_path=db_path, workload_names=args.workloads)
+                     db_path=db_path, workload_names=args.workloads,
+                     sweep_id=sweep_id)
+            pair_conn = schema.open_db(db_path)
+            spend.record_snapshot(pair_conn, api_key=api_key,
+                                  phase="pair_after_workload",
+                                  sweep_id=sweep_id, pair_label=pair_label)
+            pair_conn.close()
         except Exception as e:  # noqa: BLE001
-            print(f"[sweep] {flavor}/{gpu_class} FAILED: {e}", file=sys.stderr)
+            print(f"[sweep] {pair_label} FAILED: {e}", file=sys.stderr)
         finally:
             if endpoint_id:
                 try:
@@ -215,6 +251,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 except Exception as e:  # noqa: BLE001
                     print(f"[sweep] WARN: tear-down for {endpoint_id} failed: {e}. "
                           f"Check the RunPod console!", file=sys.stderr)
+            pair_conn = schema.open_db(db_path)
+            spend.record_snapshot(pair_conn, api_key=api_key, phase="pair_end",
+                                  sweep_id=sweep_id, pair_label=pair_label)
+            pair_conn.close()
+
+    conn = schema.open_db(db_path)
+    snap_end = spend.record_snapshot(conn, api_key=api_key, phase="sweep_end",
+                                     sweep_id=sweep_id)
+    if snap_end and snap:
+        delta = snap['balance_usd'] - snap_end['balance_usd']
+        print(f"[sweep] balance end: ${snap_end['balance_usd']:.4f} "
+              f"(spent ${delta:.4f} this sweep)", file=sys.stderr)
+    conn.close()
 
     print(f"\n[sweep] done. Run "
           f"`python3 -m build.bench.report --db-path {db_path}` for analysis.",

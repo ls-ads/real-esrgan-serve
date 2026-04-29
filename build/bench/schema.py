@@ -91,9 +91,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
       endpoint_id TEXT,
       workload TEXT NOT NULL,
       params_json TEXT,
-      notes TEXT
+      notes TEXT,
+      sweep_id TEXT
     );
     CREATE INDEX IF NOT EXISTS runs_by_workload ON runs (workload, gpu_class, flavor);
+    -- runs_by_sweep is created AFTER the column-existence check below
+    -- (older DBs need the ALTER TABLE first; CREATE INDEX would 422 on
+    -- a column that doesn't exist yet, even with IF NOT EXISTS).
 
     -- Per-job (i.e. per RunPod request) record. A request may carry
     -- multiple images — see batch_size + sum-of-exec_ms across items.
@@ -147,6 +151,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
       FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
     );
     """)
+
+    # Migrate older DBs that pre-date the runs.sweep_id column.
+    # SQLite ALTER TABLE ADD COLUMN is a no-op once the column exists.
+    cur = conn.execute("PRAGMA table_info(runs)")
+    if "sweep_id" not in {r[1] for r in cur}:
+        conn.execute("ALTER TABLE runs ADD COLUMN sweep_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS runs_by_sweep ON runs (sweep_id)")
 
     # Refresh pricing rows. UPSERT in case the user ever passes new
     # rates — pricing changes don't invalidate prior runs (each run

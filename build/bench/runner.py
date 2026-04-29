@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import schema, workloads
+from . import schema, spend, workloads
 from .workloads import JobSpec, Workload, png_for_size
 
 RUNPOD_API_BASE = "https://api.runpod.ai/v2"
@@ -167,26 +167,40 @@ def run_workload(*, endpoint_id: str, api_key: str,
                  sm_arch: Optional[str],
                  workload: Workload,
                  db_path: Path = schema.DEFAULT_DB_PATH,
-                 notes: Optional[str] = None) -> str:
+                 notes: Optional[str] = None,
+                 sweep_id: Optional[str] = None,
+                 record_balance: bool = True) -> str:
     """Execute a workload against a deployed endpoint. Writes a `runs`
-    row plus N `jobs` rows to the DB. Returns the run_id."""
+    row plus N `jobs` rows to the DB. Returns the run_id.
+
+    When `record_balance=True` (default), captures balance snapshots
+    at run-start and run-end so the report can reconcile predicted vs
+    measured spend. Set False for tests / dry runs that shouldn't
+    pollute the snapshot timeline."""
     conn = schema.open_db(db_path)
     schema.init_schema(conn)
+    spend.init_schema(conn)
 
     run_id = str(uuid.uuid4())
     conn.execute(
         """INSERT INTO runs (run_id, started_at_utc, flavor, image_tag,
                              gpu_class, sm_arch, endpoint_id, workload,
-                             params_json, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             params_json, notes, sweep_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (run_id, _utcnow_iso(), flavor, image_tag, gpu_class, sm_arch,
          endpoint_id, workload.name,
          json.dumps({"description": workload.description,
                      "concurrency": workload.concurrency,
                      "spec_count": len(workload.specs)}),
-         notes),
+         notes, sweep_id),
     )
     conn.commit()
+
+    if record_balance:
+        spend.record_snapshot(conn, api_key=api_key, phase="run_start",
+                              sweep_id=sweep_id,
+                              pair_label=f"{flavor}/{gpu_class}",
+                              run_id=run_id)
 
     print(f"[bench] run_id={run_id} workload={workload.name} "
           f"flavor={flavor} gpu={gpu_class} jobs={len(workload.specs)}",
@@ -237,6 +251,12 @@ def run_workload(*, endpoint_id: str, api_key: str,
     conn.execute("UPDATE runs SET finished_at_utc = ? WHERE run_id = ?",
                  (_utcnow_iso(), run_id))
     conn.commit()
+
+    if record_balance:
+        spend.record_snapshot(conn, api_key=api_key, phase="run_end",
+                              sweep_id=sweep_id,
+                              pair_label=f"{flavor}/{gpu_class}",
+                              run_id=run_id)
     conn.close()
     print(f"[bench] run {run_id} done.", file=sys.stderr)
     return run_id

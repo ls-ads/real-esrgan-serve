@@ -17,7 +17,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from . import schema
+from . import schema, spend
 
 
 def _print_table(rows: list[sqlite3.Row], cols: list[str]) -> None:
@@ -69,13 +69,31 @@ def cmd_summary(conn: sqlite3.Connection) -> None:
                 "peak_vram_mb", "peak_temp_c"]
         _print_table([dict(zip([d[0] for d in conn.execute(schema.QUERIES["telemetry_summary"]).description], r)) for r in rows], cols)
 
+    # Spend reconciliation — only show if there's any snapshot data,
+    # so older runs (predating the snapshot wiring) don't print empty
+    # tables.
+    cur = conn.execute("SELECT COUNT(*) FROM cost_snapshots WHERE balance_usd IS NOT NULL")
+    if cur.fetchone()[0] > 0:
+        print("\n=== spend per pair (measured) ===")
+        cur = conn.execute(spend.RECONCILE_QUERIES["spend_per_pair"])
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        _print_table(rows, cols)
+
+        print("\n=== predicted vs measured ===")
+        cur = conn.execute(spend.RECONCILE_QUERIES["predicted_vs_measured"])
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        _print_table(rows, cols)
+
 
 def cmd_query(conn: sqlite3.Connection, name: str) -> None:
-    if name not in schema.QUERIES:
-        print(f"unknown query '{name}'. available: {list(schema.QUERIES.keys())}",
+    queries = {**schema.QUERIES, **spend.RECONCILE_QUERIES}
+    if name not in queries:
+        print(f"unknown query '{name}'. available: {list(queries.keys())}",
               file=sys.stderr)
         sys.exit(2)
-    cur = conn.execute(schema.QUERIES[name])
+    cur = conn.execute(queries[name])
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     _print_table(rows, cols)
