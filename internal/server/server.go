@@ -408,37 +408,18 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("multipart: %v", err), http.StatusBadRequest)
 		return
 	}
-	file, header, err := r.FormFile("image")
+	file, _, err := r.FormFile("image")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("missing 'image' field: %v", err), http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	// Backpressure gate. With concurrency=1 and 5 in-flight requests
-	// we hold 4 here while the 5th runs.
-	select {
-	case s.gates <- struct{}{}:
-	case <-r.Context().Done():
-		return
-	}
-	defer func() { <-s.gates }()
-
-	// Stage input + output in a tmp dir scoped to this request. Helper
-	// reads input/writes output by path, not over stdin/stdout, so we
-	// avoid base64 round-trip overhead for big images.
-	tmpDir, err := os.MkdirTemp("", "res-job-")
+	in, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("tmpdir: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("read input: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer os.RemoveAll(tmpDir)
-
-	inExt := filepath.Ext(header.Filename)
-	if inExt == "" {
-		inExt = ".bin"
-	}
-	inPath := filepath.Join(tmpDir, "input"+inExt)
 
 	outExt := r.URL.Query().Get("ext")
 	if outExt == "" {
@@ -447,39 +428,19 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 	if outExt[0] != '.' {
 		outExt = "." + outExt
 	}
-	outPath := filepath.Join(tmpDir, "output"+outExt)
 
-	tmpIn, err := os.Create(inPath)
+	select {
+	case s.gates <- struct{}{}:
+	case <-r.Context().Done():
+		return
+	}
+	out, _, err := s.runOnePathBased(r.Context(), in, outExt)
+	<-s.gates
 	if err != nil {
-		http.Error(w, fmt.Sprintf("write input: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if _, err := io.Copy(tmpIn, file); err != nil {
-		tmpIn.Close()
-		http.Error(w, fmt.Sprintf("copy input: %v", err), http.StatusInternalServerError)
-		return
-	}
-	tmpIn.Close()
-
-	jobID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddUint64(&jobSeq, 1))
-
-	// 2 minute hard ceiling per request — the helper itself respects
-	// the same value in WarmHelper.upscale-equivalent logic. If a job
-	// takes longer than that, something's wrong.
-	jobCtx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-
-	if _, err := s.helper.upscale(jobCtx, jobID, inPath, outPath); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	out, err := os.Open(outPath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read output: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer out.Close()
 	switch outExt {
 	case ".png":
 		w.Header().Set("Content-Type", "image/png")
@@ -490,7 +451,7 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	if _, err := io.Copy(w, out); err != nil {
+	if _, err := w.Write(out); err != nil {
 		// Already wrote headers; can't change status now. Log + move on.
 		fmt.Fprintf(os.Stderr, "warn: stream output: %v\n", err)
 	}
