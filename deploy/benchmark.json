@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "tool": "real-esrgan",
+  "warmup": 3,
+  "measure": 10,
+  "input_resource": "deploy/bench/64x64-rgb.png.b64",
+  "request_template": {
+    "input": {
+      "tile": true,
+      "output_format": "jpg",
+      "discard_output": true
+    }
+  },
+  "metrics": [
+    {"name": "p50_latency_ms", "from": "exec_ms", "agg": "p50"},
+    {"name": "p95_latency_ms", "from": "exec_ms", "agg": "p95"},
+    {"name": "p99_latency_ms", "from": "exec_ms", "agg": "p99"},
+    {"name": "mean_latency_ms", "from": "exec_ms", "agg": "mean"}
+  ]
+}

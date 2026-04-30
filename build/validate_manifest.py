@@ -94,6 +94,48 @@ def validate_runpod(path: Path) -> None:
         require(path, e, "value", str)
 
 
+ALLOWED_AGGS = {"mean", "p50", "p95", "p99", "max", "min"}
+
+
+def validate_benchmark(path: Path) -> None:
+    with path.open() as f:
+        try:
+            obj = json.load(f)
+        except json.JSONDecodeError as e:
+            fail(path, f"invalid JSON: {e}")
+
+    sv = require(path, obj, "schema_version", str)
+    if sv != SCHEMA_VERSION:
+        fail(path, f"schema_version is {sv!r}, validator only knows {SCHEMA_VERSION!r}")
+
+    require(path, obj, "tool", str)
+    warmup = require(path, obj, "warmup", int)
+    measure = require(path, obj, "measure", int)
+    if warmup < 0:
+        fail(path, f"warmup must be >= 0, got {warmup}")
+    if measure <= 0:
+        fail(path, f"measure must be > 0, got {measure}")
+
+    res_rel = require(path, obj, "input_resource", str)
+    res_path = path.parent.parent / res_rel  # repo root / <relative>
+    if not res_path.is_file():
+        fail(path, f"input_resource {res_rel!r} not found at {res_path}")
+
+    require(path, obj, "request_template", dict)
+
+    metrics = require(path, obj, "metrics", list)
+    if not metrics:
+        fail(path, "metrics must declare at least one entry")
+    for i, m in enumerate(metrics):
+        if not isinstance(m, dict):
+            fail(path, f"metrics[{i}] must be an object")
+        require(path, m, "name", str)
+        require(path, m, "from", str)
+        agg = require(path, m, "agg", str)
+        if agg not in ALLOWED_AGGS:
+            fail(path, f"metrics[{i}].agg {agg!r} not in {sorted(ALLOWED_AGGS)}")
+
+
 def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     deploy = repo / "deploy"
@@ -105,9 +147,13 @@ def main() -> int:
     if not runpod.exists():
         print(f"[validate-manifest] missing deploy/runpod.json", file=sys.stderr)
         return 1
-
     validate_runpod(runpod)
     print(f"[validate-manifest] OK: {runpod.relative_to(repo)}")
+
+    bench = deploy / "benchmark.json"
+    if bench.exists():
+        validate_benchmark(bench)
+        print(f"[validate-manifest] OK: {bench.relative_to(repo)}")
     return 0
 
 

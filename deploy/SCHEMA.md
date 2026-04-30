@@ -31,6 +31,22 @@ The `*-serve` module owns its deploy specs because:
 2. **Tool authorship**: anyone writing a new `*-serve` module can declare its deploy shape without touching iosuite's source. iosuite is one binary that supports many tools.
 3. **Versioning**: `iosuite endpoint deploy --tool real-esrgan --version <git-tag>` fetches this file at that git tag. Pinning is exact.
 
+## `benchmark.json`
+
+Drives `iosuite endpoint benchmark --tool real-esrgan --endpoint-id <id>`. The serve module owns the workload (which input to use, how many warmups, what metrics matter); iosuite owns the wire (POST loop, timing, aggregation, output formatting).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `schema_version` | string | yes | Independent of `runpod.json`'s version. `"1"` today. |
+| `tool` | string | yes | Must match `runpod.json`'s tool. |
+| `warmup` | int | yes | Requests issued + ignored before measurement begins. Catches RunPod cold-start variance. |
+| `measure` | int | yes | Requests recorded for metric aggregation. |
+| `input_resource` | string | yes | Repo-relative path to a base64-encoded image (e.g. `deploy/bench/64x64-rgb.png.b64`). iosuite fetches this at the same git tag as the manifest itself. |
+| `request_template.input` | object | yes | Worker-side payload. iosuite injects `images:[{image_base64: ...}]` from `input_resource`; everything else (tile, output_format, discard_output) ships verbatim. |
+| `metrics` | array | yes | Each entry `{name, from, agg}`. `from` names a numeric field on the worker's per-item response (e.g. `exec_ms`). `agg` is one of `mean`, `p50`, `p95`, `p99`, `max`, `min`. |
+
+Sized for "is the endpoint healthy + how fast does a small request return" rather than "find the optimal GPU class across the matrix" (that's still in `build/bench/sweep.py`, kept separate as a maintainer tool).
+
 ## Validation
 
 `build/validate_manifest.py` parses every manifest under `deploy/` against the schema above. CI runs it on every PR; failures block merge. The same script is used by iosuite's manifest fetcher to second-guess the wire data.
