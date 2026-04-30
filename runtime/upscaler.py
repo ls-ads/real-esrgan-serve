@@ -145,6 +145,14 @@ class TrtSession:
     """
 
     def __init__(self, engine_path: Path) -> None:
+        # Boot is the most common SIGSEGV site (engine/sm-arch mismatch,
+        # CUDA driver / TRT runtime mismatch, missing libnvinfer). When
+        # the helper subprocess dies with exit=-11 the handler captures
+        # the last stderr line — so emit a breadcrumb before each step
+        # that could segfault. Without these, "stderr_tail=\n" tells us
+        # nothing.
+        print(f"[trt] boot: importing tensorrt + cuda-python",
+              file=sys.stderr, flush=True)
         try:
             import tensorrt as trt  # type: ignore[import-not-found]
             from cuda import cudart  # type: ignore[import-not-found]
@@ -153,16 +161,25 @@ class TrtSession:
                 f"TRT-direct path requires tensorrt + cuda-python: {e}"
             ) from e
         import numpy as np  # noqa: F401  imported here so np is loaded once
+        print(f"[trt] boot: tensorrt={trt.__version__}",
+              file=sys.stderr, flush=True)
 
         self._trt = trt
         self._cudart = cudart
 
+        print(f"[trt] boot: opening logger + runtime",
+              file=sys.stderr, flush=True)
         logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
+        print(f"[trt] boot: deserializing engine {engine_path.name} "
+              f"({engine_path.stat().st_size} bytes)",
+              file=sys.stderr, flush=True)
         with engine_path.open("rb") as f:
             engine = runtime.deserialize_cuda_engine(f.read())
         if engine is None:
             raise RuntimeError(f"failed to deserialize engine: {engine_path}")
+        print(f"[trt] boot: engine deserialized, creating execution context",
+              file=sys.stderr, flush=True)
         self._engine = engine
         self._context = engine.create_execution_context()
 
