@@ -30,6 +30,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,6 +126,11 @@ func run(o *opts) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upscale", srv.handleUpscale)
 	mux.HandleFunc("/health", srv.handleHealth)
+	// /runsync is the JSON envelope shape iosuite-serve and RunPod
+	// workers use. Keeping /upscale's multipart shape too for any
+	// existing callers (`iosuite upscale` local-mode, ad-hoc curl).
+	// See deploy/SCHEMA.md for the wire contract.
+	mux.HandleFunc("/runsync", srv.handleRunSync)
 
 	addr := fmt.Sprintf("%s:%d", o.bind, o.port)
 	httpSrv := &http.Server{
@@ -491,3 +497,162 @@ func (s *Server) handleUpscale(w http.ResponseWriter, r *http.Request) {
 }
 
 var jobSeq uint64
+
+// handleRunSync — JSON-envelope alias of /upscale matching the
+// iosuite-serve / RunPod-worker wire contract. iosuite's
+// LocalProvider posts here unchanged from what it would post to a
+// RunPod endpoint, which means local mode and serverless mode are
+// indistinguishable from the iosuite caller's perspective.
+//
+// Wire shape (request):
+//
+//	{"input": {
+//	    "images": [{"image_base64": "..."}, ...],
+//	    "output_format": "jpg" | "png" | "webp",
+//	    "tile": false                  // not yet supported here; rejected if true
+//	}}
+//
+// Response:
+//
+//	{"status": "COMPLETED",
+//	 "output": {"outputs": [{"image_base64": "...", "exec_ms": ...,
+//	                          "output_format": "..."}]}}
+//
+// Errors return non-2xx so iosuite can branch on status code +
+// JSON error body. tile:true returns 400 explaining the limitation.
+func (s *Server) handleRunSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	const maxBody = 25 * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	type imageInput struct {
+		ImageBase64 string `json:"image_base64,omitempty"`
+	}
+	type runSyncInput struct {
+		Images        []imageInput `json:"images"`
+		OutputFormat  string       `json:"output_format,omitempty"`
+		Tile          bool         `json:"tile,omitempty"`
+		DiscardOutput bool         `json:"discard_output,omitempty"`
+	}
+	type runSyncReq struct {
+		Input runSyncInput `json:"input"`
+	}
+	type imageOutput struct {
+		ImageBase64  string `json:"image_base64,omitempty"`
+		ExecMS       int    `json:"exec_ms"`
+		OutputFormat string `json:"output_format,omitempty"`
+	}
+	type runSyncResp struct {
+		Status string `json:"status"`
+		Output struct {
+			Outputs []imageOutput `json:"outputs"`
+		} `json:"output"`
+	}
+
+	var req runSyncReq
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(req.Input.Images) == 0 {
+		http.Error(w, "input.images is required (non-empty array)", http.StatusBadRequest)
+		return
+	}
+	if req.Input.Tile {
+		// Tile mode lives in the RunPod worker (providers/runpod/handler.py
+		// + runtime/tiling.py). The local Go server currently shells a
+		// per-image helper that doesn't honour the flag. Failing loud
+		// here keeps the caller from silently getting un-tiled output.
+		http.Error(w, "tile=true is not supported by `real-esrgan-serve serve` — use the RunPod worker for inputs >1280²", http.StatusBadRequest)
+		return
+	}
+
+	outFormat := req.Input.OutputFormat
+	if outFormat == "" {
+		outFormat = "jpg"
+	}
+	outExt := "." + outFormat
+
+	resp := runSyncResp{Status: "COMPLETED"}
+	resp.Output.Outputs = make([]imageOutput, 0, len(req.Input.Images))
+
+	for i, img := range req.Input.Images {
+		if img.ImageBase64 == "" {
+			http.Error(w, fmt.Sprintf("input.images[%d].image_base64 is required", i), http.StatusBadRequest)
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(img.ImageBase64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("decode input.images[%d].image_base64: %v", i, err), http.StatusBadRequest)
+			return
+		}
+
+		// Backpressure gate per image — same semantics as
+		// handleUpscale's single-image path.
+		select {
+		case s.gates <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
+
+		out, execMS, err := s.runOnePathBased(r.Context(), raw, outExt)
+		<-s.gates
+		if err != nil {
+			http.Error(w, fmt.Sprintf("upscale image %d: %v", i, err), http.StatusInternalServerError)
+			return
+		}
+
+		var b64Out string
+		if !req.Input.DiscardOutput {
+			b64Out = base64.StdEncoding.EncodeToString(out)
+		}
+		resp.Output.Outputs = append(resp.Output.Outputs, imageOutput{
+			ImageBase64:  b64Out,
+			ExecMS:       execMS,
+			OutputFormat: outFormat,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: encode runsync response: %v\n", err)
+	}
+}
+
+// runOnePathBased stages the input bytes to a tmp dir, calls the
+// helper, reads the output, and returns it. Shared by /upscale's
+// multipart path and /runsync's JSON path so both produce
+// byte-identical results.
+func (s *Server) runOnePathBased(ctx context.Context, in []byte, outExt string) ([]byte, int, error) {
+	tmpDir, err := os.MkdirTemp("", "res-job-")
+	if err != nil {
+		return nil, 0, fmt.Errorf("tmpdir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input.bin")
+	outPath := filepath.Join(tmpDir, "output"+outExt)
+
+	if err := os.WriteFile(inPath, in, 0o644); err != nil {
+		return nil, 0, fmt.Errorf("write input: %w", err)
+	}
+
+	jobID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddUint64(&jobSeq, 1))
+	jobCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	t0 := time.Now()
+	if _, err := s.helper.upscale(jobCtx, jobID, inPath, outPath); err != nil {
+		return nil, 0, err
+	}
+	out, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read output: %w", err)
+	}
+	return out, int(time.Since(t0).Milliseconds()), nil
+}
