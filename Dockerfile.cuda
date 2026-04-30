@@ -120,7 +120,7 @@ COPY build/dist/realesrgan-x4plus_fp16.onnx \
 
 # Late-arriving artefacts (small, change every build) ────────────────
 COPY --from=gobuild /out/real-esrgan-serve /usr/local/bin/real-esrgan-serve
-COPY runtime/upscaler.py /usr/share/real-esrgan-serve/runtime/upscaler.py
+COPY runtime/ /usr/share/real-esrgan-serve/runtime/
 RUN chmod +x /usr/share/real-esrgan-serve/runtime/upscaler.py
 
 # Ship licensing notices alongside the binary so redistribution
