@@ -9,7 +9,7 @@ endpoint.
 
 | Property | Value |
 |---|---|
-| **Image dimensions** | 64 × 64 minimum, **1280 × 1280 maximum** per axis (handler-enforced) |
+| **Image dimensions** | 64 × 64 minimum, **1280 × 1280 maximum** per axis without tiling, **4096 × 4096 maximum** with `tile: true` |
 | **Aspect ratio** | Any — H and W are independently dynamic; rectangular OK |
 | **Upscale factor** | Fixed 4× (output is exactly `(4·W) × (4·H)` pixels) |
 | **Input formats accepted** | PNG, JPEG, WebP, BMP, TIFF, GIF, plus any other format PIL recognises |
@@ -239,39 +239,54 @@ running a batch of 64 frames.
 ## 6. Beyond 1280: tiling
 
 For inputs over 1280 in any axis (1080p frames, 4K stills, etc.),
-**preprocess into tiles** before sending. The pipeline doesn't tile
-internally today — the handler hard-rejects.
+set **`tile: true`** at the top level of the request payload. The
+handler accepts inputs up to 4096 × 4096 in tile mode and slices
+them server-side; callers see one input → one output, same I/O
+shape as a non-tiled request.
 
-The recipe upstream Real-ESRGAN uses (and that we'd implement
-server-side if it's added):
+```json
+{"input": {"image_url": "https://...", "tile": true,
+           "output_format": "jpg"}}
+```
 
-  1. Pad input dimensions up to a tile-grid multiple.
-  2. Slice into tiles of e.g. 1024 × 1024 with a 32-pixel overlap
-     on each shared edge.
-  3. Run each tile through the upscaler. With overlap=32 →
-     output tile pairs share a 128-pixel band.
-  4. Linear-blend (or Hann-window) the overlap zones.
-  5. Crop the final stitched output back to `(4·in_w, 4·in_h)`.
+Algorithm (`runtime/tiling.py`):
+
+  1. Slice into 1024 × 1024 tiles with ≥32 px overlap on shared
+     edges. Tile count is the smallest that covers the full image
+     with at least min-overlap; positions are evenly distributed
+     so adjacent tiles share a wide blend region.
+  2. Run inference per tile through the warm session (no extra
+     warmup cost — `serve` mode keeps the engine resident).
+  3. Stitch into the output canvas with linear ramps across the
+     full overlap region. Two complementary ramps sum to 1.0
+     everywhere → no visible seams.
+  4. Output is exactly 4× the input on each axis, same as the
+     untiled path.
 
 Trade-offs:
 
-  - Memory + per-tile time bounded; total time ≈ `n_tiles × per-tile`.
-  - For a 4 K (3840 × 2160) input with 1024² tiles + 32 overlap,
-    ~9 tiles. At ~600 ms per tile on rtx-4090 trt batch=1, that's
-    ~5.4 s before any networking.
-  - With the batched engine (8 tiles fit ≤ 720 + overlap), you can
-    knock that to ~1.5-2 s.
+  - Memory: float32 stitch canvas. ~200 MB at 2K input → 8K output;
+    ~3 GB at 4K input → 16K output. The 4096² cap is set by this
+    canvas allocation; larger inputs need streaming-strip
+    processing (a future enhancement).
+  - Latency: per-tile time × tile count. For a 4 K (3840 × 2160)
+    input with 1024² tiles and ~32 px overlap → 12 tiles. At
+    ~600 ms per tile on rtx-4090 trt → ~7 s GPU time. Smaller
+    inputs (≤ 2K) tile into 4 tiles → ~2.5 s.
+  - The batched engine doesn't help — its profile maxes at 720²,
+    smaller than the tile size.
 
-If a customer needs tiling routinely, see the "Server-side tiling"
-follow-up in `docs/BENCHMARKS.md` § 7 — about 1-2 days of handler
-work to add a `tile: true` flag and an internal split / stitch
-path.
+Inputs at or below 1280 × 1280 with `tile: true` short-circuit to
+the single-shot path inside the helper at zero extra cost. Setting
+`tile: true` unconditionally is safe and is the recommended pattern
+for callers that don't pre-check dimensions.
 
 ## 7. Failure modes (what callers see)
 
 | Trigger | Response |
 |---|---|
-| Input > 1280 × 1280 | `{"output": {"error": "input WxH exceeds max 1280x1280"}}` |
+| Input > 1280 × 1280 (tile not set) | `{"output": {"error": "input WxH exceeds max 1280x1280 (set tile=true to accept up to 4096x4096)"}}` |
+| Input > 4096 × 4096 (tile=true) | `{"output": {"error": "input WxH exceeds max 4096x4096"}}` |
 | Input < 64 in either dim | `{"output": {"error": "set_input_shape(...) rejected — outside the engine's optimisation profile"}}` |
 | All input fields empty | Validation error mentioning `image_url, image_base64, image_path` |
 | `output_format` not in `{"jpg", "png"}` | Pydantic validation error |

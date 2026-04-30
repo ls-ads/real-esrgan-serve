@@ -21,11 +21,15 @@ I/O contract:
     --output PATH      where to write upscaled image (parent created)
     --model PATH       path to .onnx (resolved by Go side)
     --gpu-id INT       CUDA device index; -1 = CPU
+    --tile             tile-based inference for inputs > 1280² (the engine's
+                       single-shot cap). Safe to leave on always — small
+                       inputs skip the slice/stitch overhead.
     --json-events      emit progress as one JSON object per line on stdout
 
   Stdin (serve mode):
     one JSON object per line, e.g.
     {"id": "abc", "input": "/tmp/in.jpg", "output": "/tmp/out.jpg"}
+    Optional `"tile": true` enables the tile-based path for that frame.
 
   Stdout (json-events / serve mode):
     {"event": "ready"}                                 once after model load
@@ -456,6 +460,39 @@ def _postprocess_and_save(out_tensor, output_path: Path) -> None:
     img.save(output_path)
 
 
+def _run_tiled(session, input_path: Path, output_path: Path) -> None:
+    """Tile-based one-shot for inputs that exceed the engine's
+    single-shot cap (1280² profile max). Slices into ≤1024² tiles with
+    32-px overlap, runs the inference path per tile, blends into a
+    single output canvas. See runtime/tiling.py for the algorithm.
+
+    Lazy-imports tiling.py so the helper still loads (and `--help`
+    still works) on systems without numpy/Pillow installed; the inner
+    code path needs both anyway."""
+    from PIL import Image  # type: ignore[import-not-found]
+
+    # Tiling module sits next to this file (runtime/tiling.py). Both
+    # are shipped as siblings (Dockerfile + Linux-package install layout
+    # land them in the same dir), so a same-package import is safe at
+    # runtime even though this script is invoked detached from any
+    # `runtime` package via `python3 upscaler.py ...`.
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tiling  # type: ignore[import-not-found]
+
+    img = Image.open(input_path)
+
+    def infer(chw):
+        # `_run_inference` returns a list (matches ORT.run shape); take
+        # the first entry. Tiling.py expects (1, 3, 4·t_h, 4·t_w).
+        return _run_inference(session, chw)[0]
+
+    out_img = tiling.upscale_tiled(img, infer)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_img.save(output_path)
+
+
 def run_one_shot(args: argparse.Namespace) -> int:
     je = args.json_events
     model = Path(args.model)
@@ -470,19 +507,28 @@ def run_one_shot(args: argparse.Namespace) -> int:
     session = _load_session(model, args.gpu_id, je, provider=args.provider)
     _emit(je, event="model_loaded", elapsed_ms=int((time.monotonic() - t0) * 1000))
 
-    _emit(je, event="preprocessing", input=str(inp))
-    chw, w, h = _preprocess(inp)
+    if args.tile:
+        _emit(je, event="inferring_tiled", input=str(inp))
+        t0 = time.monotonic()
+        try:
+            _run_tiled(session, inp, out)
+        except Exception as e:  # noqa: BLE001
+            _die(2, f"tiled inference failed: {e}", je)
+        _emit(je, event="inferred", elapsed_ms=int((time.monotonic() - t0) * 1000))
+    else:
+        _emit(je, event="preprocessing", input=str(inp))
+        chw, w, h = _preprocess(inp)
 
-    _emit(je, event="inferring", width=w, height=h)
-    t0 = time.monotonic()
-    try:
-        result = _run_inference(session, chw)
-    except Exception as e:  # noqa: BLE001
-        _die(2, f"inference failed: {e}", je)
-    _emit(je, event="inferred", elapsed_ms=int((time.monotonic() - t0) * 1000))
+        _emit(je, event="inferring", width=w, height=h)
+        t0 = time.monotonic()
+        try:
+            result = _run_inference(session, chw)
+        except Exception as e:  # noqa: BLE001
+            _die(2, f"inference failed: {e}", je)
+        _emit(je, event="inferred", elapsed_ms=int((time.monotonic() - t0) * 1000))
 
-    _emit(je, event="postprocessing", output=str(out))
-    _postprocess_and_save(result[0], out)
+        _emit(je, event="postprocessing", output=str(out))
+        _postprocess_and_save(result[0], out)
 
     _emit(je, event="done", output=str(out))
     return 0
@@ -501,8 +547,11 @@ def run_serve(args: argparse.Namespace) -> int:
     Two frame shapes accepted:
 
       Single image:
-        {"id": "...", "input": "/path/to/in.jpg", "output": "/path/to/out.jpg"}
-        → routes to the primary session.
+        {"id": "...", "input": "/path/to/in.jpg", "output": "/path/to/out.jpg",
+         "tile": false}
+        → routes to the primary session. `tile: true` opts into the
+          slice/blend/stitch path for inputs larger than the engine's
+          1280² profile max (see runtime/tiling.py).
         → emits {"event": "done", "id": "...", "output": "..."}
 
       Batched (same shape across all items):
@@ -565,9 +614,15 @@ def run_serve(args: argparse.Namespace) -> int:
             continue
 
         try:
-            chw, w, h = _preprocess(Path(job["input"]))
-            result = _run_inference(session, chw)
-            _postprocess_and_save(result[0], Path(job["output"]))
+            if job.get("tile"):
+                # Tile-based path for inputs above the engine's 1280²
+                # profile max. Slices, infers per tile on the warm
+                # session, blends. See runtime/tiling.py.
+                _run_tiled(session, Path(job["input"]), Path(job["output"]))
+            else:
+                chw, w, h = _preprocess(Path(job["input"]))
+                result = _run_inference(session, chw)
+                _postprocess_and_save(result[0], Path(job["output"]))
             _emit(True, event="done", id=job_id, output=job["output"])
         except Exception as e:  # noqa: BLE001
             _emit(True, event="error", id=job_id, msg=str(e))
@@ -673,6 +728,13 @@ def main() -> int:
                         "back silently.")
     p.add_argument("--json-events", action="store_true", help="emit progress as JSONL on stdout")
     p.add_argument("--serve", action="store_true", help="daemon mode: read JSONL jobs from stdin")
+    p.add_argument("--tile", action="store_true",
+                   help="tile-based inference for inputs larger than the "
+                        "engine's 1280² profile max. Slices into ≤1024² "
+                        "tiles, runs per-tile inference, blends overlap "
+                        "regions. Safe to set on any input — sub-1024 "
+                        "inputs go through the single-shot path with no "
+                        "extra cost. See runtime/tiling.py.")
     args = p.parse_args()
 
     if args.serve:

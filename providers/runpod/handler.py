@@ -47,6 +47,12 @@ log = RunPodLogger()
 # Tunables (env-driven so RunPod's endpoint config can flip them)
 # ───────────────────────────────────────────────────────────────────────
 MAX_INPUT_DIM = 1280
+# Tile-mode cap. Inputs above this are still rejected; tiling lets us
+# accept anything in (1280, MAX_INPUT_DIM_TILED] by slicing internally.
+# 4096 is the practical ceiling for the float32 stitch canvas
+# (~3 GB at 16K output) — larger inputs need streaming-strip processing
+# which is a separate follow-up.
+MAX_INPUT_DIM_TILED = int(os.environ.get("MAX_INPUT_DIM_TILED", "4096"))
 RUNTIME_HELPER = Path(
     os.environ.get("REAL_ESRGAN_RUNTIME", "/usr/share/real-esrgan-serve/runtime/upscaler.py")
 )
@@ -135,6 +141,13 @@ class BatchPayload(BaseModel):
     output_format: Literal["png", "jpg"] = "jpg"
     discard_output: bool = False
     telemetry: bool = False
+    # Opt into the tile-based path for inputs above the single-shot cap.
+    # When false (default), inputs > MAX_INPUT_DIM are rejected pre-GPU.
+    # When true, inputs up to MAX_INPUT_DIM_TILED are sliced into ≤1024²
+    # tiles by the helper, processed per-tile, blended into one output.
+    # Per-tile inference time × tile count, no batched-engine path —
+    # tiles are typically larger than the batched profile's 720² cap.
+    tile: bool = False
 
     @model_validator(mode="after")
     def _normalize(self) -> "BatchPayload":
@@ -401,11 +414,27 @@ class WarmHelper:
         finally:
             self._pending.pop(job_id, None)
 
-    def upscale(self, input_path: Path, output_path: Path, job_id: str, timeout: float = 120.0) -> dict:
+    def upscale(
+        self,
+        input_path: Path,
+        output_path: Path,
+        job_id: str,
+        timeout: float = 120.0,
+        *,
+        tile: bool = False,
+    ) -> dict:
+        """Single-image inference. ``tile=True`` opts the helper into the
+        slice/blend/stitch path for inputs above the engine's 1280²
+        single-shot cap; small inputs short-circuit through the
+        single-shot path inside upscale_tiled at no extra cost. Timeout
+        defaults are sized for the single-shot path; tiled jobs on a 4K
+        input can run 5–10 s of pure GPU time, so callers should bump
+        ``timeout`` accordingly."""
         frame = json.dumps({
             "id": job_id,
             "input": str(input_path),
             "output": str(output_path),
+            "tile": tile,
         })
         return self._send_and_wait(frame, job_id, timeout)
 
@@ -588,22 +617,32 @@ class TelemetrySampler:
 
 
 def _stage_one_item(item: InputPayload, default_format: str, job_id: str,
-                    idx: int) -> tuple[Path, Path, int, int, str, dict]:
+                    idx: int, tile_enabled: bool) -> tuple[Path, Path, int, int, str, dict]:
     """Decode + size-check + stage to disk for a single batch item.
     Returns (in_path, out_path, in_w, in_h, fmt, partial_output_dict).
 
     Split out from the helper-call step so the orchestrator can stage
     every item up front, then group by shape, then dispatch batched
     helper calls for each group. Lets us keep the per-item failure
-    isolation while sharing the helper's batched forward pass."""
+    isolation while sharing the helper's batched forward pass.
+
+    ``tile_enabled`` raises the per-axis cap from MAX_INPUT_DIM (single-
+    shot engine profile) to MAX_INPUT_DIM_TILED (handler-side stitching
+    ceiling, gated by canvas memory). Items above MAX_INPUT_DIM but
+    within MAX_INPUT_DIM_TILED route through the tiled inference path
+    in `_process_batch`; items at or below MAX_INPUT_DIM stay on the
+    fast single-shot path even when tile_enabled is true."""
     fmt = item.output_format or default_format
     img_bytes, src_label = _fetch_image_bytes(item, job_id)
 
     with Image.open(BytesIO(img_bytes)) as img:
         in_w, in_h = img.size
-        if in_w > MAX_INPUT_DIM or in_h > MAX_INPUT_DIM:
+        cap = MAX_INPUT_DIM_TILED if tile_enabled else MAX_INPUT_DIM
+        if in_w > cap or in_h > cap:
             raise ValueError(
-                f"input {in_w}x{in_h} exceeds max {MAX_INPUT_DIM}x{MAX_INPUT_DIM}"
+                f"input {in_w}x{in_h} exceeds max {cap}x{cap}"
+                + ("" if tile_enabled else " (set tile=true to accept up to "
+                   f"{MAX_INPUT_DIM_TILED}x{MAX_INPUT_DIM_TILED})")
             )
 
     suffix = ".jpg" if fmt == "jpg" else ".png"
@@ -651,7 +690,8 @@ def _finalise_one_item(*, item: InputPayload, in_path: Path, out_path: Path,
 
 
 def _process_batch(items: list[InputPayload], default_format: str,
-                   discard_output: bool, job_id: str) -> tuple[list[dict], list[dict]]:
+                   discard_output: bool, job_id: str,
+                   tile_enabled: bool) -> tuple[list[dict], list[dict]]:
     """Stage every item, group by shape, dispatch each group through
     the helper (batched if N > 1, single if N == 1), match outputs
     back to original indices.
@@ -672,7 +712,7 @@ def _process_batch(items: list[InputPayload], default_format: str,
     errors: list[dict] = []
     for idx, item in enumerate(items):
         try:
-            staged[idx] = _stage_one_item(item, default_format, job_id, idx)
+            staged[idx] = _stage_one_item(item, default_format, job_id, idx, tile_enabled)
         except Exception as e:  # noqa: BLE001
             log.error(f"item {idx} stage: {e}", request_id=job_id)
             errors.append({"index": idx, "error": str(e)})
@@ -695,7 +735,13 @@ def _process_batch(items: list[InputPayload], default_format: str,
     use_batched = bool(_HELPER and _HELPER.batched_model_name)
     outputs: list[Optional[dict]] = [None] * len(items)
     for shape, indices in groups.items():
-        if use_batched and len(indices) >= 2:
+        # Items above the engine's single-shot profile route through the
+        # helper's tile path (single-frame JSONL with tile=true). The
+        # batched engine's profile maxes at 720² so it's already
+        # unreachable for these shapes anyway — no perf left on the table.
+        group_needs_tile = shape[0] > MAX_INPUT_DIM or shape[1] > MAX_INPUT_DIM
+
+        if use_batched and len(indices) >= 2 and not group_needs_tile:
             in_paths = [staged[i][0] for i in indices]
             out_paths = [staged[i][1] for i in indices]
             group_id = f"{job_id or 'job'}_grp_{shape[0]}x{shape[1]}"
@@ -732,13 +778,21 @@ def _process_batch(items: list[InputPayload], default_format: str,
                         pass
                 continue
 
-        # Single-engine path (no batched engine OR group size 1).
+        # Single-engine path (no batched engine, group size 1, OR tile-mode).
+        # Bumping the per-item timeout for tiled jobs — a 4K input
+        # tiles into 9 forward passes which can run 5–10 s of pure GPU
+        # time on a 4090, comfortably above the 120 s default but below
+        # the 240 s ceiling we now use here.
+        item_timeout = 240.0 if group_needs_tile else 120.0
         for i in indices:
             in_p, out_p, _, _, _, partial = staged[i]
             item_id = f"{job_id or 'job'}_{shape[0]}x{shape[1]}_{i}"
             t0_ms = time.monotonic() * 1000
             try:
-                result = _HELPER.upscale(in_p, out_p, job_id=item_id)
+                result = _HELPER.upscale(
+                    in_p, out_p, job_id=item_id,
+                    timeout=item_timeout, tile=group_needs_tile,
+                )
                 exec_ms = int(time.monotonic() * 1000 - t0_ms)
                 if result.get("event") != "done":
                     raise RuntimeError(result.get("msg", "helper returned unexpected event"))
@@ -792,6 +846,7 @@ def handler(job):
                 payload.output_format,
                 payload.discard_output,
                 job_id,
+                payload.tile,
             )
         finally:
             samples = sampler.stop() if sampler else None
