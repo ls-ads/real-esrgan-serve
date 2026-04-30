@@ -1,0 +1,28 @@
+# Validate deploy/*.json manifests on every push + PR.
+#
+# These manifests are the source-of-truth for how iosuite (the
+# cross-tool CLI) deploys this *-serve module to RunPod. A bad
+# manifest doesn't break this repo's tests — it breaks anyone who
+# runs `iosuite endpoint deploy --tool real-esrgan` against a tag
+# containing the bad file. This gate catches it before the tag.
+
+name: manifest-validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "build/validate_manifest.py"
+      - ".github/workflows/manifest-validate.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 build/validate_manifest.py

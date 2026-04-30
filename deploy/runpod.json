@@ -1,0 +1,41 @@
+{
+  "schema_version": "1",
+  "tool": "real-esrgan",
+  "description": "Real-ESRGAN 4x upscaler — TensorRT-accelerated worker for RunPod serverless.",
+  "image": "ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-0.2.1",
+  "endpoint": {
+    "container_disk_gb": 10,
+    "workers_max_default": 2,
+    "idle_timeout_s_default": 30,
+    "flashboot_default": true,
+    "min_cuda_version": "12.8"
+  },
+  "gpu_pools": {
+    "rtx-5090":    "BLACKWELL_96",
+    "rtx-5080":    "BLACKWELL_96",
+    "rtx-4090":    "ADA_24",
+    "rtx-4080":    "ADA_24",
+    "rtx-4080-s":  "ADA_24",
+    "rtx-3090":    "AMPERE_24",
+    "rtx-3090-ti": "AMPERE_24",
+    "l4":          "AMPERE_24",
+    "a5000":       "AMPERE_24",
+    "l40":         "ADA_48_PRO",
+    "l40s":        "ADA_48_PRO",
+    "rtx-6000":    "ADA_48_PRO",
+    "a40":         "AMPERE_48",
+    "a6000":       "AMPERE_48",
+    "a4000":       "AMPERE_16",
+    "a4500":       "AMPERE_16",
+    "rtx-4000":    "AMPERE_16",
+    "rtx-2000":    "AMPERE_16",
+    "a100":        "AMPERE_80",
+    "a100-sxm":    "AMPERE_80",
+    "h100":        "HOPPER_141",
+    "h100-sxm":    "HOPPER_141",
+    "h100-nvl":    "HOPPER_141",
+    "h200":        "HOPPER_141",
+    "b200":        "BLACKWELL_180"
+  },
+  "env": []
+}
