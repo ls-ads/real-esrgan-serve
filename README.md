@@ -1,59 +1,36 @@
 # real-esrgan-serve
 
-GPU-side serving CLI for the [iosuite](https://github.com/ls-ads/iosuite) ecosystem.
-Runs Real-ESRGAN inference locally (subprocess to a Python runtime
-helper) or on a configured provider (RunPod first; vast.ai and others
-follow the same provider-template shape).
+GPU-side worker for the [iosuite](https://github.com/ls-ads/iosuite)
+ecosystem. Runs Real-ESRGAN inference locally (Go binary subprocesses
+a Python helper) or as a RunPod serverless template that the iosuite
+CLI deploys + tears down on demand.
 
-The user-facing CLI is `iosuite` — this repo is what `iosuite` shells
-out to under the hood. You probably want this repo if:
+The user-facing CLI is `iosuite`. Reach for this repo if you want to:
 
-- you're self-hosting iosuite on your own GPU box
-- you're contributing to the model side (perf, new providers, new variants)
-- you want to deploy the RunPod template directly
-
-For the broader architecture, read [`ARCHITECTURE.md`](./ARCHITECTURE.md).
-
-## What changed in this rebuild
-
-The previous version of this repo linked directly to TensorRT via CGO
-and shipped a Dockerfile based on `nvcr.io/nvidia/tensorrt`, which has
-license terms that conflict with downstream Apache-2.0 redistribution.
-It also carried committed `.onnx` and `.engine` blobs (~hundreds of
-MB) in the repo.
-
-The rebuild:
-
-- Drops the CGO bridge — Go subprocesses to a small Python helper
-  using onnxruntime instead
-- Switches to `nvidia/cuda:12.x-runtime-ubuntu22.04` (CUDA EULA only)
-- Moves model artefacts out of git into GitHub Releases, with
-  `models/MANIFEST.json` + SHA-256 verification on fetch
-- Folds in the standalone `runpod-real-esrgan` repo as
-  `providers/runpod/`
+- Self-host on your own GPU box, with or without iosuite.
+- Build a new image flavour (different precision, different EP).
+- Contribute to the worker side: tiling, batching, provider templates.
+- Ship a new variant of the model.
 
 ## Quick start (local)
 
-Requirements:
-
-- Linux x86_64 with an NVIDIA GPU (CUDA 12.x driver)
-- Python 3.10+ with `onnxruntime-gpu`, `numpy`, `pillow`
-- Go 1.25+ (only if building from source)
+Requirements: Linux x86_64, NVIDIA GPU + CUDA 12.x driver, Python
+3.10+ with `onnxruntime-gpu` / `numpy` / `pillow`. Go 1.25+ if
+building from source.
 
 ```bash
 git clone https://github.com/ls-ads/real-esrgan-serve
 cd real-esrgan-serve
-make build               # builds ./bin/real-esrgan-serve
+make build               # → ./bin/real-esrgan-serve
 
-# fetch a verified model artefact (caches under XDG cache dir)
+# Pull a verified model artefact (caches under XDG cache dir).
 ./bin/real-esrgan-serve fetch-model --name realesrgan-x4plus --variant fp16
 
-# upscale a single image (subprocess to runtime/upscaler.py)
+# One-shot upscale.
 ./bin/real-esrgan-serve upscale -i photo.jpg -o photo_4x.jpg
 
-# or run as a daemon for batch / hot-path workloads
-./bin/real-esrgan-serve serve --port 8311 &
-./bin/real-esrgan-serve upscale -i photo.jpg -o photo_4x.jpg
+# Or run as a daemon (warm engine, JSON wire shape).
+./bin/real-esrgan-serve serve --port 8311
 ```
 
 CPU fallback works (slowly) for testing without a GPU:
@@ -64,55 +41,87 @@ CPU fallback works (slowly) for testing without a GPU:
 
 ## Quick start (Docker)
 
+Three image flavours — pick what your host can satisfy:
+
 ```bash
-docker build -t real-esrgan-serve:dev .
+make docker-cpu          # ~280 MB, no GPU dep, slow
+make docker-cuda         # ~870 MB, NVIDIA + ORT CUDA EP
+make docker-trt          # ~2 GB, NVIDIA + TensorRT direct execution
+```
+
+Run any of them:
+
+```bash
 docker run --rm --gpus all \
-    -v $PWD/models:/models \
-    -v $PWD/imgs:/work \
-    real-esrgan-serve:dev \
+    -v $PWD/models:/models -v $PWD/imgs:/work \
+    real-esrgan-serve:trt-dev \
     upscale -i /work/in.jpg -o /work/out.jpg --model realesrgan-x4plus
 ```
 
 ## Subcommands
 
-| Command                          | Purpose                                                        |
-|----------------------------------|----------------------------------------------------------------|
-| `real-esrgan-serve upscale`      | One-shot inference. Subprocesses to the Python runtime.        |
-| `real-esrgan-serve serve`        | Long-lived HTTP daemon — keeps the ORT session warm.           |
-| `real-esrgan-serve fetch-model`  | Pull a verified `.onnx` artefact from GitHub Releases.         |
+| Command                          | What it does                                                  |
+|----------------------------------|---------------------------------------------------------------|
+| `real-esrgan-serve upscale`      | One-shot inference. Subprocesses the Python runtime helper.   |
+| `real-esrgan-serve serve`        | Long-lived HTTP daemon. `POST /runsync` (JSON), `POST /upscale` (multipart). |
+| `real-esrgan-serve fetch-model`  | Pull a verified `.onnx` / `.engine` artefact from GitHub Releases. |
 
-Run `real-esrgan-serve <cmd> --help` for the full flag surface.
+`real-esrgan-serve <cmd> --help` prints the full flag surface.
+
+The daemon's JSON envelope matches what iosuite serve and the RunPod
+worker expect:
+
+```
+POST /runsync   Content-Type: application/json
+{"input": {"images": [{"image_base64": "..."}],
+           "tile": true, "output_format": "jpg"}}
+
+→ {"status": "COMPLETED",
+   "output": {"outputs": [{"image_base64": "...", "exec_ms": 612}]}}
+```
+
+`tile: true` slices inputs >1280² into 1024² tiles, infers per
+tile, and stitches with linear-ramp blending in the overlap zones —
+inputs up to 4096² are handled this way.
 
 ## Provider templates
 
-Each provider lives under `providers/<name>/` with its own Dockerfile,
-handler, and README. The handler subprocesses the same Python runtime
-helper the local CLI uses, so behaviour matches across local + cloud.
+Each provider lives under `providers/<name>/` with its own
+Dockerfile, handler, and README. The handler subprocesses the same
+Python runtime helper the local CLI uses; behaviour is identical
+across local + cloud.
 
-Currently shipping:
+- [`providers/runpod/`](./providers/runpod/) — RunPod serverless
+  template. Deployed by `iosuite endpoint deploy --tool real-esrgan`
+  using the manifest at [`deploy/runpod.json`](./deploy/runpod.json).
 
-- [`providers/runpod/`](./providers/runpod/) — RunPod serverless template
+## Deploy manifests
 
-In progress:
+`deploy/runpod.json` is the source-of-truth for how iosuite deploys
+this module to RunPod: image tag, container disk, GPU pool map per
+class, FlashBoot default, CUDA pin, env vars. iosuite reads it at
+deploy time — bumping any of those fields lands here, not in iosuite.
 
-- `providers/vast/` — vast.ai
+`deploy/benchmark.json` declares the matching benchmark suite for
+`iosuite endpoint benchmark`: warmup count, measure count, request
+template, metrics, and the input image to send.
+
+Field reference: [`deploy/SCHEMA.md`](./deploy/SCHEMA.md).
+Validator (CI gate): [`build/validate_manifest.py`](./build/validate_manifest.py).
 
 ## Performance
 
-For the hosted iosuite.io service, the cost lever is concurrent
-throughput on a single GPU. Strategies live in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md): warm `serve` mode
-with one ORT session per worker, single-session multi-goroutine
-fan-in, lazy weight unload.
-
 Cold-start numbers from a RunPod RTX 4090 ADA_24 deploy
-(realesrgan-x4plus FP16 ONNX, 64×64 → 256×256 test input,
-ONNX + CUDA EP):
+(realesrgan-x4plus FP16, TensorRT direct execution):
 
-| Mode                                    | Latency               | Notes                  |
-|-----------------------------------------|-----------------------|------------------------|
-| Cold start (full e2e)                   | ~46 s                 | dominated by image pull|
-| Warm exec (CUDA EP)                     | ~400 ms               | p50 across 5 jobs      |
+| Mode                                    | Latency               | Notes                          |
+|-----------------------------------------|-----------------------|--------------------------------|
+| Cold start (full e2e, no FlashBoot)     | ~46 s                 | dominated by image pull        |
+| Cold start with FlashBoot               | ~5 s                  | snapshot resume                |
+| Warm exec (TRT)                         | ~19 ms                | p50 across 10 jobs (64×64 in)  |
+| Tiled 2K → 8K (TRT, warm)               | ~70 s                 | 2048×1500 → 8192×6000          |
+
+Performance discussion: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 ## Repo layout
 
@@ -122,39 +131,37 @@ real-esrgan-serve/
 ├── cmd/real-esrgan-serve/   Go CLI entry point
 ├── internal/
 │   ├── upscale/             one-shot subprocess flow
-│   ├── server/              HTTP daemon mode
+│   ├── server/              HTTP daemon mode (/runsync + /upscale)
 │   ├── modelfetch/          GH-Releases-backed fetch + SHA-256 verify
 │   └── runtime/             helper-locator + invocation primitives
-├── runtime/upscaler.py      Python helper (onnxruntime + CUDA EP)
-├── providers/
-│   └── runpod/              RunPod serverless template
-├── build/                   .pth → .onnx pipeline (producer side)
+├── runtime/upscaler.py      Python helper (ORT or TRT direct)
+├── runtime/tiling.py        slice / infer / stitch for >1280² inputs
+├── providers/runpod/        RunPod serverless template
+├── deploy/                  iosuite-readable deploy + benchmark manifests
+├── build/                   .pth → .onnx → .engine pipeline
 ├── models/MANIFEST.json     model artefact registry (URL + SHA-256)
 └── docs/                    PERFORMANCE.md, PROVIDER-GUIDE.md, ...
 ```
 
-## Building the model artefacts yourself
+## Building model artefacts
 
-The `.onnx` files served via GitHub Releases are reproducible from
-upstream Real-ESRGAN `.pth` weights. See
-[`build/README.md`](./build/README.md) for the pipeline. Run
-`make artifacts` for the full pipeline locally, or trigger the
-release workflow on tag push for CI to build + publish.
+The `.onnx` / `.engine` files served via GitHub Releases are
+reproducible from upstream Real-ESRGAN `.pth` weights. See
+[`build/README.md`](./build/README.md) for the pipeline.
+`make artifacts` runs the full pipeline locally; the release workflow
+on tag push builds + publishes to GitHub Releases for CI.
+
+## Documentation
+
+- iosuite CLI reference (covers iosuite endpoint deploy / benchmark
+  flow against this worker): <https://iosuite.io/cli-docs>
+- Architecture: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+- Manifest schema: [`deploy/SCHEMA.md`](./deploy/SCHEMA.md)
 
 ## License
 
-This project's own code is Apache-2.0 — see [`LICENSE`](./LICENSE).
-The patent-grant + termination clause matters for ML/inference work
-where method patents are not theoretical; the trade-off vs MIT is
-the NOTICE preservation requirement, which we satisfy with
-[`NOTICE.md`](./NOTICE.md).
-
-It redistributes and depends on third-party software (Real-ESRGAN
-weights under BSD-3-Clause, NVIDIA CUDA runtime libraries under the
-NVIDIA EULA, onnxruntime / Pillow / Pydantic / et al under various
-permissive licenses). All attributions, obligations, and redistribution
-rules are catalogued in `NOTICE.md`, which also ships inside the
-runtime container at `/usr/share/doc/real-esrgan-serve/`.
-
-When forking or vendoring this repo, preserve `LICENSE`, `NOTICE.md`,
-and `third-party-licenses/`.
+Apache-2.0. See [`LICENSE`](./LICENSE) for the text and
+[`NOTICE.md`](./NOTICE.md) for third-party attributions
+(Real-ESRGAN weights, NVIDIA CUDA runtime, ONNX Runtime, TensorRT,
+Pillow, et al). When forking or vendoring, preserve `LICENSE`,
+`NOTICE.md`, and `third-party-licenses/`.
