@@ -2,7 +2,7 @@
   "schema_version": "1",
   "tool": "real-esrgan",
   "description": "Real-ESRGAN 4x upscaler — TensorRT-accelerated worker for RunPod serverless.",
-  "image": "ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-0.2.1",
+  "image": "ghcr.io/ls-ads/real-esrgan-serve:runpod-trt-0.2.2",
   "endpoint": {
     "container_disk_gb": 10,
     "workers_max_default": 2,
