@@ -124,11 +124,15 @@ func run(o *opts) error {
 
 	srv := &Server{helper: helper, gates: make(chan struct{}, o.concurrency)}
 	mux := http.NewServeMux()
+	// /super-resolution is the canonical multipart route; /upscale is
+	// kept as a name-only alias for any existing callers that learned
+	// the legacy path. Same handler either way.
+	mux.HandleFunc("/super-resolution", srv.handleUpscale)
 	mux.HandleFunc("/upscale", srv.handleUpscale)
 	mux.HandleFunc("/health", srv.handleHealth)
 	// /runsync is the JSON envelope shape iosuite-serve and RunPod
-	// workers use. Keeping /upscale's multipart shape too for any
-	// existing callers (`iosuite upscale` local-mode, ad-hoc curl).
+	// workers use. The multipart routes above stay for ad-hoc curl /
+	// `real-esrgan-serve super-resolution` local mode.
 	// See deploy/SCHEMA.md for the wire contract.
 	mux.HandleFunc("/runsync", srv.handleRunSync)
 

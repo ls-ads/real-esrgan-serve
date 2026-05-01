@@ -1,5 +1,7 @@
-// Package upscale implements the `upscale` subcommand: one-shot
-// inference via subprocess to the Python runtime helper.
+// Package upscale implements the `super-resolution` subcommand:
+// one-shot inference via subprocess to the Python runtime helper.
+// Package directory keeps the legacy `upscale` name to avoid churn;
+// the user-facing command is `super-resolution`.
 //
 // Flow:
 //  1. Validate flags + resolve input/output paths
@@ -49,17 +51,26 @@ type opts struct {
 	modelPath     string // override the manifest lookup; absolute path to .onnx
 }
 
-// Command returns the Cobra command tree for `upscale`.
+// Command returns the Cobra command tree for `super-resolution`.
+// The legacy `upscale` name is kept as an alias so existing scripts
+// keep working — but the canonical name is `super-resolution`,
+// matching the iosuite ecosystem's tool/verb taxonomy.
 func Command() *cobra.Command {
 	o := &opts{}
 	cmd := &cobra.Command{
-		Use:   "upscale",
-		Short: "Upscale a single image or directory via local subprocess",
-		Long: `Run Real-ESRGAN inference on a single image or every image in a
-directory. The CLI subprocesses to runtime/upscaler.py, which uses
-onnxruntime (CUDA EP if available, CPU EP otherwise). For hot-path
-workloads, prefer 'real-esrgan-serve serve' to keep the engine warm
-across many requests.`,
+		Use:     "super-resolution",
+		Aliases: []string{"upscale"},
+		Short:   "Run AI super-resolution on a single image or directory via local subprocess",
+		Long: `Run Real-ESRGAN AI super-resolution on a single image or every image
+in a directory. The CLI subprocesses to runtime/upscaler.py, which
+uses onnxruntime (CUDA EP if available, CPU EP otherwise). For
+hot-path workloads, prefer 'real-esrgan-serve serve' to keep the
+engine warm across many requests.
+
+This is the AI super-resolution path — the model reconstructs detail
+rather than just resampling pixels. For fast classical upscaling
+(lanczos, bicubic, etc), use 'iosuite resize' (which dispatches to
+ffmpeg-serve).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(o)
 		},
